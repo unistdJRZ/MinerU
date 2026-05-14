@@ -1,8 +1,11 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import asyncio
+import hashlib
+import json
 import mimetypes
 import multiprocessing
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -33,6 +36,11 @@ from loguru import logger
 
 from base64 import b64encode
 
+from mineru.backend.office.office_middle_json_mkcontent import (
+    mk_blocks_to_markdown as office_blocks_to_markdown,
+)
+from mineru.backend.pipeline.pipeline_middle_json_mkcontent import make_blocks_to_markdown
+from mineru.backend.vlm.vlm_middle_json_mkcontent import mk_blocks_to_markdown
 from mineru.cli.common import (
     aio_do_parse,
     do_parse,
@@ -44,6 +52,7 @@ from mineru.cli.common import (
     read_fn,
     uniquify_task_stems,
 )
+from mineru.cli.job_store import JobStore
 from mineru.cli.public_http_client_policy import (
     configure_public_http_client_policy,
     is_public_bind_host,
@@ -67,6 +76,7 @@ from mineru.utils.config_reader import (
     get_max_concurrent_requests as read_max_concurrent_requests,
     get_processing_window_size,
 )
+from mineru.utils.enum_class import MakeMode
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
 from mineru.utils.pdf_image_tools import shutdown_pdf_render_executor
 from mineru.version import __version__
@@ -81,11 +91,23 @@ TASK_PROCESSING = "processing"
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
 TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED}
+COMPAT_STATUS_PENDING = "PENDING"
+COMPAT_STATUS_RUNNING = "RUNNING"
+COMPAT_STATUS_FINISHED = "FINISHED"
+COMPAT_STATUS_FAIL = "FAIL"
+COMPAT_STATUS_BY_TASK_STATUS = {
+    TASK_PENDING: COMPAT_STATUS_PENDING,
+    TASK_PROCESSING: COMPAT_STATUS_RUNNING,
+    TASK_COMPLETED: COMPAT_STATUS_FINISHED,
+    TASK_FAILED: COMPAT_STATUS_FAIL,
+}
 SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
 RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 DEFAULT_OUTPUT_ROOT = "./output"
+DEFAULT_JOB_STORE_PATH = os.path.join(".", "output", "mineru_jobs.sqlite3")
+COMPAT_CACHE_SCHEMA_VERSION = 2
 ALLOWED_PARSE_METHODS = {"auto", "txt", "ocr"}
 FILE_PARSE_TASK_ID_HEADER = "X-MinerU-Task-Id"
 FILE_PARSE_TASK_STATUS_HEADER = "X-MinerU-Task-Status"
@@ -291,6 +313,9 @@ async def startup_app_state(app: FastAPI) -> "AsyncTaskManager":
     task_manager = AsyncTaskManager(app)
     await task_manager.start()
     try:
+        get_job_store_for_app(app).mark_incomplete_jobs_failed(
+            "Parse interrupted because the service restarted before completion"
+        )
         service_config = getattr(app.state, "service_config", {})
         model_config = getattr(app.state, "config", {})
         maybe_preload_vlm_model(
@@ -364,6 +389,26 @@ def get_output_root() -> Path:
     root = Path(os.getenv("MINERU_API_OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT)).expanduser()
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
+
+
+def get_job_store_path() -> str:
+    configured_path = os.getenv("MINERU_API_JOB_STORE_PATH")
+    if configured_path:
+        return configured_path
+    return str((get_output_root() / "mineru_jobs.sqlite3").resolve())
+
+
+def get_job_store_for_app(fastapi_app: FastAPI) -> JobStore:
+    current_path = os.path.abspath(get_job_store_path())
+    initialized_path = getattr(fastapi_app.state, "job_store_path", None)
+    if not hasattr(fastapi_app.state, "job_store") or initialized_path != current_path:
+        fastapi_app.state.job_store = JobStore(current_path)
+        fastapi_app.state.job_store_path = current_path
+    return fastapi_app.state.job_store
+
+
+def get_job_store() -> JobStore:
+    return get_job_store_for_app(app)
 
 
 def warn_if_public_http_client_policy(host: str, allow_public_http_client: bool) -> None:
@@ -517,6 +562,181 @@ def build_result_dict(
                 for image_path in image_paths
             }
     return result_dict
+
+
+def json_sha256(payload: dict[str, Any]) -> str:
+    payload_str = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+
+def bytes_sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def read_json_result(file_suffix_identifier: str, pdf_name: str, parse_dir: str) -> Any:
+    result_text = get_infer_result(file_suffix_identifier, pdf_name, parse_dir)
+    if result_text is None:
+        return None
+    return json.loads(result_text)
+
+
+def replace_markdown_images_with_base64(markdown_text: str, images_dir: str) -> str:
+    if not markdown_text or not os.path.isdir(images_dir):
+        return markdown_text
+
+    def replace(match: re.Match[str]) -> str:
+        original_path = match.group(1)
+        image_name = os.path.basename(original_path)
+        image_path = os.path.join(images_dir, image_name)
+        if not os.path.exists(image_path):
+            return match.group(0)
+        return (
+            f"![{image_name}]"
+            f"(data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)})"
+        )
+
+    return re.sub(r"!\[(?:[^\]]*)\]\(([^)]+)\)", replace, markdown_text)
+
+
+def middle_json_to_chunks(
+    middle_json: dict[str, Any],
+    backend: str,
+    formula_enable: bool,
+    table_enable: bool,
+    images_dir: str,
+    parse_dir: str,
+) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    pdf_info = middle_json.get("pdf_info", [])
+    parse_dir_name = os.path.basename(parse_dir)
+    is_pipeline_backend = backend.startswith("pipeline")
+    is_office_output = parse_dir_name == "office"
+
+    for page_idx, page_info in enumerate(pdf_info):
+        para_blocks = page_info.get("para_blocks") or []
+        page_size = page_info.get("page_size") or []
+        page_index = page_info.get("page_idx", page_idx)
+
+        for para_block in para_blocks:
+            if is_office_output:
+                md_list = office_blocks_to_markdown(
+                    [para_block],
+                    make_mode=MakeMode.MM_MD,
+                    img_buket_path="images",
+                    page_idx=page_index,
+                )
+            elif is_pipeline_backend:
+                md_list = make_blocks_to_markdown(
+                    [para_block],
+                    MakeMode.MM_MD,
+                    img_buket_path="images",
+                )
+            else:
+                md_list = mk_blocks_to_markdown(
+                    [para_block],
+                    MakeMode.MM_MD,
+                    formula_enable,
+                    table_enable,
+                    img_buket_path="images",
+                )
+
+            if not md_list:
+                continue
+
+            markdown = replace_markdown_images_with_base64(md_list[0], images_dir)
+            if not markdown:
+                continue
+
+            chunks.append(
+                {
+                    "chunk_id": len(chunks),
+                    "page_idx": page_index,
+                    "page_size": page_size,
+                    "bbox": para_block.get("bbox", []),
+                    "markdown": markdown,
+                    "content_type": para_block.get("type"),
+                }
+            )
+    return chunks
+
+
+def can_rebuild_compat_job_content(job: dict[str, Any]) -> bool:
+    for pdf_name in job["source_pdf_file_names"]:
+        try:
+            parse_dir = get_parse_dir(
+                job["unique_dir"],
+                pdf_name,
+                job["backend"],
+                job["parse_method"],
+            )
+        except ValueError:
+            return False
+        if not os.path.exists(parse_dir):
+            return False
+    return True
+
+
+def build_compat_result_content(job: dict[str, Any]) -> dict[str, Any]:
+    result_dict: dict[str, dict[str, Any]] = {}
+    source_names = job["source_pdf_file_names"]
+    response_names = job.get("response_pdf_file_names") or source_names
+    if len(response_names) != len(source_names):
+        response_names = source_names
+
+    for source_name, response_name in zip(source_names, response_names):
+        data: dict[str, Any] = {}
+        result_dict[response_name] = data
+        parse_dir = get_parse_dir(
+            job["unique_dir"],
+            source_name,
+            job["backend"],
+            job["parse_method"],
+        )
+        images_dir = os.path.join(parse_dir, "images")
+
+        data["md_content"] = get_infer_result(".md", source_name, parse_dir)
+        middle_json = read_json_result("_middle.json", source_name, parse_dir)
+        if middle_json is not None:
+            data["chunk"] = middle_json_to_chunks(
+                middle_json=middle_json,
+                backend=job["backend"],
+                formula_enable=job["formula_enable"],
+                table_enable=job["table_enable"],
+                images_dir=images_dir,
+                parse_dir=parse_dir,
+            )
+        else:
+            data["chunk"] = []
+
+        image_paths = get_images_dir_image_paths(images_dir)
+        data["images"] = {
+            os.path.basename(
+                image_path
+            ): f"data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)}"
+            for image_path in image_paths
+        }
+
+    return {
+        "backend": job["backend"],
+        "version": __version__,
+        "results": result_dict,
+    }
+
+
+def build_compat_job_content(job: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if job["status"] == COMPAT_STATUS_FINISHED:
+        if job.get("content") is not None:
+            return job["content"]
+        if can_rebuild_compat_job_content(job):
+            return build_compat_result_content(job)
+        return {"error": "Persisted result files are missing and the response cannot be rebuilt"}
+
+    if job["status"] == COMPAT_STATUS_FAIL:
+        if job.get("content") is not None:
+            return job["content"]
+        if job.get("error_message"):
+            return {"error": job["error_message"]}
+    return None
 
 
 def build_zip_arcname(
@@ -1099,6 +1319,244 @@ async def create_async_parse_task(
         raise
 
 
+def build_compat_parse_options(files: list[UploadFile]) -> ParseRequestOptions:
+    # Keep these aligned with parse_request_form defaults, while forcing outputs
+    # needed by the legacy /content response.
+    return ParseRequestOptions(
+        files=files,
+        lang_list=["ch"],
+        backend="vlm-auto-engine",
+        parse_method="auto",
+        formula_enable=True,
+        table_enable=True,
+        image_analysis=True,
+        server_url=None,
+        return_md=True,
+        return_middle_json=True,
+        return_model_output=False,
+        return_content_list=False,
+        return_images=True,
+        response_format_zip=False,
+        return_original_file=False,
+        start_page_id=0,
+        end_page_id=99999,
+    )
+
+
+def build_compat_result_hash(
+    *,
+    pdf_hashes: list[str],
+    request_options: ParseRequestOptions,
+    config: dict[str, Any],
+) -> str:
+    return json_sha256(
+        {
+            "cache_schema_version": COMPAT_CACHE_SCHEMA_VERSION,
+            "api_protocol_version": API_PROTOCOL_VERSION,
+            "mineru_version": __version__,
+            "pdf_hashes": pdf_hashes,
+            "lang_list": request_options.lang_list,
+            "backend": request_options.backend,
+            "parse_method": request_options.parse_method,
+            "formula_enable": request_options.formula_enable,
+            "table_enable": request_options.table_enable,
+            "image_analysis": request_options.image_analysis,
+            "return_md": request_options.return_md,
+            "return_middle_json": request_options.return_middle_json,
+            "return_model_output": request_options.return_model_output,
+            "return_content_list": request_options.return_content_list,
+            "return_images": request_options.return_images,
+            "return_original_file": request_options.return_original_file,
+            "start_page_id": request_options.start_page_id,
+            "end_page_id": request_options.end_page_id,
+            "config": config,
+        }
+    )
+
+
+def build_compat_job_record(
+    *,
+    ocr_id: str,
+    source_ocr_id: Optional[str],
+    result_hash: str,
+    status: str,
+    output_dir: str,
+    source_file_names: list[str],
+    response_file_names: list[str],
+    uploads: list[StoredUpload],
+    pdf_hashes: list[str],
+    file_suffixes: list[str],
+    request_options: ParseRequestOptions,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ocr_id": ocr_id,
+        "task_id": ocr_id,
+        "source_ocr_id": source_ocr_id,
+        "result_hash": result_hash,
+        "status": status,
+        "unique_dir": output_dir,
+        "output_dir": output_dir,
+        "source_pdf_file_names": source_file_names,
+        "response_pdf_file_names": response_file_names,
+        "upload_names": [upload.original_name for upload in uploads],
+        "uploads": [upload.path for upload in uploads],
+        "file_suffixes": file_suffixes,
+        "pdf_hashes": pdf_hashes,
+        "lang_list": request_options.lang_list,
+        "config": config,
+        "backend": request_options.backend,
+        "parse_method": request_options.parse_method,
+        "formula_enable": request_options.formula_enable,
+        "table_enable": request_options.table_enable,
+        "image_analysis": request_options.image_analysis,
+        "server_url": request_options.server_url,
+        "return_md": request_options.return_md,
+        "return_middle_json": request_options.return_middle_json,
+        "return_model_output": request_options.return_model_output,
+        "return_content_list": request_options.return_content_list,
+        "return_images": request_options.return_images,
+        "return_original_file": request_options.return_original_file,
+        "start_page_id": request_options.start_page_id,
+        "end_page_id": request_options.end_page_id,
+        "content": None,
+        "error_message": None,
+    }
+
+
+def load_compat_upload_metadata(
+    uploads: list[StoredUpload],
+) -> tuple[list[str], list[str]]:
+    pdf_hashes: list[str] = []
+    file_suffixes: list[str] = []
+    for upload in uploads:
+        upload_path = Path(upload.path)
+        file_suffixes.append(guess_suffix_by_path(upload_path))
+        pdf_hashes.append(bytes_sha256(read_fn(upload_path)))
+    return pdf_hashes, file_suffixes
+
+
+async def create_compat_parse_task(
+    files: list[UploadFile],
+    ocr_id: Optional[str],
+) -> str:
+    resolved_ocr_id = (ocr_id or str(uuid.uuid4())).strip()
+    if not resolved_ocr_id:
+        raise HTTPException(status_code=400, detail="ocr_id cannot be empty")
+
+    task_manager = get_task_manager()
+    existing_task = task_manager.get(resolved_ocr_id)
+    if existing_task is not None and not is_task_terminal(existing_task.status):
+        raise HTTPException(
+            status_code=409,
+            detail=f"ocr_id is already running: {resolved_ocr_id}",
+        )
+
+    job_store = get_job_store()
+    existing_job = job_store.get_job(resolved_ocr_id)
+    if existing_job is not None:
+        if existing_job["status"] in (COMPAT_STATUS_PENDING, COMPAT_STATUS_RUNNING):
+            raise HTTPException(
+                status_code=409,
+                detail=f"ocr_id is already running: {resolved_ocr_id}",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"ocr_id already exists: {resolved_ocr_id}",
+        )
+
+    request_options = build_compat_parse_options(files)
+    task_output_dir = create_task_output_dir(resolved_ocr_id)
+    uploads_dir = os.path.join(task_output_dir, "uploads")
+    config = dict(getattr(app.state, "config", {}))
+
+    try:
+        uploads = await save_upload_files(uploads_dir, request_options.files)
+        request_options.files.clear()
+        file_names = [upload.stem for upload in uploads]
+        pdf_hashes, file_suffixes = await asyncio.to_thread(
+            load_compat_upload_metadata,
+            uploads,
+        )
+        result_hash = build_compat_result_hash(
+            pdf_hashes=pdf_hashes,
+            request_options=request_options,
+            config=config,
+        )
+
+        cached_job = job_store.find_finished_job_by_result_hash(result_hash)
+        if cached_job and can_rebuild_compat_job_content(cached_job):
+            job_store.create_job(
+                build_compat_job_record(
+                    ocr_id=resolved_ocr_id,
+                    source_ocr_id=cached_job["ocr_id"],
+                    result_hash=result_hash,
+                    status=COMPAT_STATUS_FINISHED,
+                    output_dir=cached_job["unique_dir"],
+                    source_file_names=cached_job["source_pdf_file_names"],
+                    response_file_names=file_names,
+                    uploads=[],
+                    pdf_hashes=pdf_hashes,
+                    file_suffixes=file_suffixes,
+                    request_options=request_options,
+                    config=config,
+                )
+            )
+            cleanup_file(task_output_dir)
+            return resolved_ocr_id
+
+        job_store.create_job(
+            build_compat_job_record(
+                ocr_id=resolved_ocr_id,
+                source_ocr_id=None,
+                result_hash=result_hash,
+                status=COMPAT_STATUS_PENDING,
+                output_dir=task_output_dir,
+                source_file_names=file_names,
+                response_file_names=file_names,
+                uploads=uploads,
+                pdf_hashes=pdf_hashes,
+                file_suffixes=file_suffixes,
+                request_options=request_options,
+                config=config,
+            )
+        )
+
+        task = AsyncParseTask(
+            task_id=resolved_ocr_id,
+            status=TASK_PENDING,
+            backend=request_options.backend,
+            file_names=file_names,
+            created_at=utc_now_iso(),
+            output_dir=task_output_dir,
+            parse_method=request_options.parse_method,
+            lang_list=request_options.lang_list,
+            formula_enable=request_options.formula_enable,
+            table_enable=request_options.table_enable,
+            image_analysis=request_options.image_analysis,
+            server_url=request_options.server_url,
+            return_md=request_options.return_md,
+            return_middle_json=request_options.return_middle_json,
+            return_model_output=request_options.return_model_output,
+            return_content_list=request_options.return_content_list,
+            return_images=request_options.return_images,
+            response_format_zip=request_options.response_format_zip,
+            return_original_file=request_options.return_original_file,
+            start_page_id=request_options.start_page_id,
+            end_page_id=request_options.end_page_id,
+            upload_names=[upload.original_name for upload in uploads],
+            uploads=[upload.path for upload in uploads],
+        )
+        await task_manager.submit(task)
+        return resolved_ocr_id
+    except HTTPException:
+        cleanup_file(task_output_dir)
+        raise
+    except Exception:
+        cleanup_file(task_output_dir)
+        raise
+
+
 class AsyncTaskManager:
     def __init__(self, fastapi_app: FastAPI):
         self.app = fastapi_app
@@ -1326,6 +1784,15 @@ class AsyncTaskManager:
             task.status = TASK_FAILED
             task.error = str(exc)
             task.completed_at = utc_now_iso()
+            try:
+                get_job_store_for_app(self.app).update_job(
+                    task.task_id,
+                    status=COMPAT_STATUS_FAIL,
+                    content={"error": str(exc)},
+                    error_message=str(exc),
+                )
+            except Exception as store_exc:
+                logger.warning(f"Failed to persist failed task {task_id}: {store_exc}")
             self._signal_task_event(task_id)
             logger.exception(f"Async task failed: {task_id}")
 
@@ -1333,6 +1800,13 @@ class AsyncTaskManager:
         task.status = TASK_PROCESSING
         task.started_at = utc_now_iso()
         task.error = None
+        try:
+            get_job_store_for_app(self.app).update_job(
+                task.task_id,
+                status=COMPAT_STATUS_RUNNING,
+            )
+        except Exception as store_exc:
+            logger.warning(f"Failed to persist running task {task.task_id}: {store_exc}")
 
         uploads = [
             StoredUpload(
@@ -1355,6 +1829,13 @@ class AsyncTaskManager:
         )
         task.status = TASK_COMPLETED
         task.completed_at = utc_now_iso()
+        try:
+            get_job_store_for_app(self.app).update_job(
+                task.task_id,
+                status=COMPAT_STATUS_FINISHED,
+            )
+        except Exception as store_exc:
+            logger.warning(f"Failed to persist completed task {task.task_id}: {store_exc}")
         self._signal_task_event(task.task_id)
 
     def cleanup_expired_tasks(self) -> int:
@@ -1402,7 +1883,7 @@ def get_task_manager() -> AsyncTaskManager:
 
 
 @app.post(
-    path="/file_parse",
+    path="/file_parse_sync",
     status_code=200,
     summary="Synchronously parse uploaded files",
     description=(
@@ -1447,6 +1928,73 @@ async def parse_pdf(
         task=task,
         request=http_request,
     )
+
+
+@app.post(
+    path="/file_parse",
+    status_code=200,
+    summary="Submit a legacy-compatible parse task",
+    description=(
+        "Legacy-compatible endpoint. It accepts the old multipart form fields, "
+        "ignores parse tuning fields, and returns an ocr_id for /content polling."
+    ),
+)
+async def parse_pdf_compat(
+    files: Annotated[
+        list[UploadFile],
+        File(
+            description="Upload PDF, image, DOCX, PPTX, or XLSX files for parsing",
+            openapi_extra=SWAGGER_UI_FILE_ARRAY_SCHEMA_EXTRA,
+        ),
+    ],
+    ocr_id: Annotated[Optional[str], Form()] = None,
+    return_middle_json: Annotated[Optional[bool], Form()] = None,
+    return_model_output: Annotated[Optional[bool], Form()] = None,
+    return_md: Annotated[Optional[bool], Form()] = None,
+    return_images: Annotated[Optional[bool], Form()] = None,
+    end_page_id: Annotated[Optional[int], Form()] = None,
+    parse_method: Annotated[Optional[str], Form()] = None,
+    start_page_id: Annotated[Optional[int], Form()] = None,
+    lang_list: Annotated[Optional[list[str]], Form()] = None,
+    output_dir: Annotated[Optional[str], Form()] = None,
+    server_url: Annotated[Optional[str], Form()] = None,
+    return_content_list: Annotated[Optional[bool], Form()] = None,
+    backend: Annotated[Optional[str], Form()] = None,
+    table_enable: Annotated[Optional[bool], Form()] = None,
+    response_format_zip: Annotated[Optional[bool], Form()] = None,
+    formula_enable: Annotated[Optional[bool], Form()] = None,
+):
+    del (
+        return_middle_json,
+        return_model_output,
+        return_md,
+        return_images,
+        end_page_id,
+        parse_method,
+        start_page_id,
+        lang_list,
+        output_dir,
+        server_url,
+        return_content_list,
+        backend,
+        table_enable,
+        response_format_zip,
+        formula_enable,
+    )
+    try:
+        resolved_ocr_id = await create_compat_parse_task(files, ocr_id)
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": str(exc.detail)},
+        )
+    except Exception as exc:
+        logger.exception("Failed to submit legacy-compatible parse task")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to submit parse task: {exc}"},
+        )
+    return JSONResponse(status_code=200, content={"ocr_id": resolved_ocr_id})
 
 
 @app.post(
@@ -1522,6 +2070,59 @@ async def get_async_task_result(
         response_format_zip=task.response_format_zip,
         return_original_file=task.return_original_file,
         zip_filename=f"{task.task_id}.zip",
+    )
+
+
+@app.get(path="/content")
+async def get_parse_content(ocr_id: str):
+    job_store = get_job_store()
+    job_info = job_store.get_job(ocr_id)
+    task_manager = getattr(app.state, "task_manager", None)
+    task = task_manager.get(ocr_id) if task_manager is not None else None
+
+    if job_info is None and task is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"ocr_id not found: {ocr_id}"},
+        )
+
+    if job_info is None and task is not None:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": COMPAT_STATUS_BY_TASK_STATUS.get(task.status, COMPAT_STATUS_FAIL),
+                "content": {"error": task.error} if task.error else None,
+            },
+        )
+
+    if task is not None and task.status in (TASK_PENDING, TASK_PROCESSING):
+        status = COMPAT_STATUS_BY_TASK_STATUS[task.status]
+        return JSONResponse(status_code=200, content={"status": status, "content": None})
+
+    effective_job_info = dict(job_info)
+    if task is not None and task.status == TASK_COMPLETED:
+        effective_job_info["status"] = COMPAT_STATUS_FINISHED
+    elif task is not None and task.status == TASK_FAILED:
+        effective_job_info["status"] = COMPAT_STATUS_FAIL
+        effective_job_info["error_message"] = task.error or job_info.get("error_message")
+
+    content = build_compat_job_content(effective_job_info)
+    status = effective_job_info["status"]
+    if status == COMPAT_STATUS_FINISHED and isinstance(content, dict) and "error" in content:
+        job_store.update_job(
+            ocr_id,
+            status=COMPAT_STATUS_FAIL,
+            content=content,
+            error_message=content["error"],
+        )
+        status = COMPAT_STATUS_FAIL
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": status,
+            "content": content,
+        },
     )
 
 
