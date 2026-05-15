@@ -1194,8 +1194,30 @@ def build_single_file_payload(
 
 
 def build_router_compat_payload(source: MultipartPayload) -> MultipartPayload:
-    fields = list(source.fields)
-    existing_field_names = {name for name, _ in fields}
+    ignored_compat_fields = {
+        "return_middle_json",
+        "return_model_output",
+        "return_md",
+        "return_images",
+        "end_page_id",
+        "parse_method",
+        "start_page_id",
+        "lang_list",
+        "output_dir",
+        "server_url",
+        "return_content_list",
+        "backend",
+        "table_enable",
+        "response_format_zip",
+        "formula_enable",
+        "image_analysis",
+        "return_original_file",
+    }
+    fields = [
+        (name, value)
+        for name, value in source.fields
+        if name not in ignored_compat_fields
+    ]
     compat_defaults = {
         "lang_list": "ch",
         "backend": "vlm-auto-engine",
@@ -1213,11 +1235,7 @@ def build_router_compat_payload(source: MultipartPayload) -> MultipartPayload:
         "start_page_id": "0",
         "end_page_id": "99999",
     }
-    fields.extend(
-        (name, value)
-        for name, value in compat_defaults.items()
-        if name not in existing_field_names
-    )
+    fields.extend(compat_defaults.items())
     return MultipartPayload(
         temp_dir=source.temp_dir,
         fields=fields,
