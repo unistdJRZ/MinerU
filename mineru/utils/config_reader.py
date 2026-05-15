@@ -16,18 +16,22 @@ CONFIG_FILE_NAME = os.getenv('MINERU_TOOLS_CONFIG_JSON', 'mineru.json')
 
 def read_config():
     if os.path.isabs(CONFIG_FILE_NAME):
-        config_file = CONFIG_FILE_NAME
+        config_candidates = [CONFIG_FILE_NAME]
     else:
         home_dir = os.path.expanduser('~')
-        config_file = os.path.join(home_dir, CONFIG_FILE_NAME)
+        config_candidates = [
+            os.path.abspath(CONFIG_FILE_NAME),
+            os.path.join(home_dir, CONFIG_FILE_NAME),
+        ]
 
-    if not os.path.exists(config_file):
-        # logger.warning(f'{config_file} not found, using default configuration')
-        return None
-    else:
-        with open(config_file, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-        return config
+    for config_file in config_candidates:
+        if os.path.exists(config_file):
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            return config
+
+    # logger.warning(f'{CONFIG_FILE_NAME} not found, using default configuration')
+    return None
 
 
 def get_s3_config(bucket_name: str):
