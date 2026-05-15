@@ -56,6 +56,16 @@ TASK_PROCESSING = "processing"
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
 TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED}
+COMPAT_STATUS_PENDING = "PENDING"
+COMPAT_STATUS_RUNNING = "RUNNING"
+COMPAT_STATUS_FINISHED = "FINISHED"
+COMPAT_STATUS_FAIL = "FAIL"
+COMPAT_STATUS_BY_TASK_STATUS = {
+    TASK_PENDING: COMPAT_STATUS_PENDING,
+    TASK_PROCESSING: COMPAT_STATUS_RUNNING,
+    TASK_COMPLETED: COMPAT_STATUS_FINISHED,
+    TASK_FAILED: COMPAT_STATUS_FAIL,
+}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 FILE_PARSE_TASK_ID_HEADER = "X-MinerU-Task-Id"
@@ -862,6 +872,7 @@ class RouterTaskRegistry:
     async def register(
         self,
         *,
+        task_id: str | None = None,
         upstream_server_id: str,
         upstream_base_url: str,
         upstream_task_id: str,
@@ -875,7 +886,7 @@ class RouterTaskRegistry:
         queued_ahead: int | None,
     ) -> RouterTaskRecord:
         task = RouterTaskRecord(
-            task_id=str(uuid.uuid4()),
+            task_id=task_id or str(uuid.uuid4()),
             upstream_server_id=upstream_server_id,
             upstream_task_id=upstream_task_id,
             upstream_base_url=upstream_base_url,
@@ -1171,9 +1182,64 @@ async def submit_payload_to_upstream(
     return await asyncio.to_thread(submit_payload_to_upstream_sync, base_url, payload)
 
 
+def build_single_file_payload(
+    source: MultipartPayload,
+    upload: StagedUpload,
+) -> MultipartPayload:
+    return MultipartPayload(
+        temp_dir=source.temp_dir,
+        fields=list(source.fields),
+        uploads=[upload],
+    )
+
+
+def build_router_compat_payload(source: MultipartPayload) -> MultipartPayload:
+    fields = list(source.fields)
+    existing_field_names = {name for name, _ in fields}
+    compat_defaults = {
+        "lang_list": "ch",
+        "backend": "vlm-auto-engine",
+        "parse_method": "auto",
+        "formula_enable": "true",
+        "table_enable": "true",
+        "image_analysis": "true",
+        "return_md": "true",
+        "return_middle_json": "true",
+        "return_model_output": "false",
+        "return_content_list": "false",
+        "return_images": "true",
+        "response_format_zip": "false",
+        "return_original_file": "false",
+        "start_page_id": "0",
+        "end_page_id": "99999",
+    }
+    fields.extend(
+        (name, value)
+        for name, value in compat_defaults.items()
+        if name not in existing_field_names
+    )
+    return MultipartPayload(
+        temp_dir=source.temp_dir,
+        fields=fields,
+        uploads=list(source.uploads),
+    )
+
+
+def get_router_compat_ocr_id(payload: MultipartPayload) -> str | None:
+    ocr_id = payload.get_field_value("ocr_id")
+    if ocr_id is None:
+        return None
+    normalized = ocr_id.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="ocr_id cannot be empty")
+    return normalized
+
+
 async def submit_router_task(
     request: Request,
     payload: MultipartPayload,
+    *,
+    task_id: str | None = None,
 ) -> RouterTaskRecord:
     validate_public_http_client_request(
         public_bind_exposed=bool(
@@ -1206,6 +1272,7 @@ async def submit_router_task(
                 else []
             )
             return await registry.register(
+                task_id=task_id,
                 upstream_server_id=server.server_id,
                 upstream_base_url=server.base_url,
                 upstream_task_id=upstream_payload["task_id"],
@@ -1413,6 +1480,50 @@ async def build_sync_router_task_result_response(
     )
 
 
+async def fetch_router_task_result_payload(
+    request: Request,
+    task: RouterTaskRecord,
+) -> dict[str, Any]:
+    client: httpx.AsyncClient = request.app.state.http_client
+    result_url = f"{task.upstream_base_url}{TASKS_ENDPOINT}/{task.upstream_task_id}/result"
+    try:
+        response = await client.get(
+            result_url,
+            timeout=build_result_download_timeout(),
+        )
+    except httpx.HTTPError as exc:
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if response.status_code != 200:
+        detail = response.text.strip() or response.reason_phrase
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            f"{response.status_code} {detail}",
+        )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise HTTPException(
+            status_code=502,
+            detail="content_router requires an upstream JSON task result",
+        )
+
+    try:
+        return _parse_json_object_response(response, "task result payload")
+    except ValueError as exc:
+        detail = f"Invalid task result payload: {exc}"
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            detail,
+        )
+        raise HTTPException(status_code=502, detail=detail) from exc
+
+
 def build_sync_task_headers(task: RouterTaskRecord, request: Request) -> dict[str, str]:
     payload = task.to_status_payload(request)
     return {
@@ -1520,6 +1631,108 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             )
 
         return await build_sync_router_task_result_response(request, router_task)
+
+    @app.post(path="/file_parse_router", status_code=200)
+    async def file_parse_router(request: Request):
+        payload = await stage_multipart_request(request)
+        submitted_ocr_ids: list[str] = []
+        try:
+            payload = build_router_compat_payload(payload)
+            requested_ocr_id = get_router_compat_ocr_id(payload)
+            file_uploads = [
+                upload for upload in payload.uploads if upload.field_name == "files"
+            ]
+            if not file_uploads:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "file_parse_router requires at least one files upload"},
+                )
+            if requested_ocr_id is not None and len(file_uploads) != 1:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "ocr_id can only be used with a single files upload"},
+                )
+
+            for upload_index, upload in enumerate(file_uploads):
+                single_payload = build_single_file_payload(payload, upload)
+                try:
+                    router_task = await submit_router_task(
+                        request,
+                        single_payload,
+                        task_id=requested_ocr_id if upload_index == 0 else None,
+                    )
+                except HTTPException as exc:
+                    status_code = (
+                        503
+                        if exc.status_code == 503
+                        else 500
+                        if submitted_ocr_ids
+                        else exc.status_code
+                    )
+                    return JSONResponse(
+                        status_code=status_code,
+                        content={
+                            "error": str(exc.detail),
+                            "ocr_ids": submitted_ocr_ids,
+                        },
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to submit router-compatible parse task")
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": f"Failed to submit parse task: {exc}",
+                            "ocr_ids": submitted_ocr_ids,
+                        },
+                    )
+                submitted_ocr_ids.append(router_task.task_id)
+        finally:
+            payload.cleanup()
+
+        return JSONResponse(status_code=200, content={"ocr_ids": submitted_ocr_ids})
+
+    @app.get(path="/content_router")
+    async def get_parse_content_router(ocr_id: str, request: Request):
+        registry: RouterTaskRegistry = request.app.state.router_task_registry
+        task = await registry.get(ocr_id)
+        if task is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"ocr_id not found: {ocr_id}"},
+            )
+
+        task = await fetch_router_task_status(request, task)
+        if task.status in (TASK_PENDING, TASK_PROCESSING):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": COMPAT_STATUS_BY_TASK_STATUS[task.status],
+                    "content": None,
+                },
+            )
+
+        if task.status == TASK_FAILED:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": COMPAT_STATUS_FAIL,
+                    "content": {"error": task.error} if task.error else None,
+                },
+            )
+
+        result_payload = await fetch_router_task_result_payload(request, task)
+        content = {
+            "backend": result_payload.get("backend", task.backend),
+            "version": result_payload.get("version", __version__),
+            "results": result_payload.get("results", {}),
+        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": COMPAT_STATUS_FINISHED,
+                "content": content,
+            },
+        )
 
     @app.get(path="/health")
     async def health_check(request: Request):

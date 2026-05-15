@@ -1447,23 +1447,19 @@ async def create_compat_parse_task(
     task_manager = get_task_manager()
     existing_task = task_manager.get(resolved_ocr_id)
     if existing_task is not None and not is_task_terminal(existing_task.status):
-        raise HTTPException(
-            status_code=409,
-            detail=f"ocr_id is already running: {resolved_ocr_id}",
-        )
+        existing_task.status = TASK_FAILED
+        existing_task.error = "Overwritten by a new /file_parse request"
+        existing_task.completed_at = utc_now_iso()
+        existing_event = task_manager.task_events.get(resolved_ocr_id)
+        if existing_event is not None:
+            existing_event.set()
 
     job_store = get_job_store()
     existing_job = job_store.get_job(resolved_ocr_id)
     if existing_job is not None:
-        if existing_job["status"] in (COMPAT_STATUS_PENDING, COMPAT_STATUS_RUNNING):
-            raise HTTPException(
-                status_code=409,
-                detail=f"ocr_id is already running: {resolved_ocr_id}",
-            )
-        raise HTTPException(
-            status_code=409,
-            detail=f"ocr_id already exists: {resolved_ocr_id}",
-        )
+        old_output_dir = existing_job.get("unique_dir") or existing_job.get("output_dir")
+        if old_output_dir:
+            cleanup_file(old_output_dir)
 
     request_options = build_compat_parse_options(files)
     task_output_dir = create_task_output_dir(resolved_ocr_id)
@@ -1981,6 +1977,11 @@ async def parse_pdf_compat(
         response_format_zip,
         formula_enable,
     )
+    if len(files) != 1:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "/file_parse supports exactly one file"},
+        )
     try:
         resolved_ocr_id = await create_compat_parse_task(files, ocr_id)
     except HTTPException as exc:
