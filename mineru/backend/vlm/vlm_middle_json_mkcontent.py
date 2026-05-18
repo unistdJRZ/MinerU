@@ -61,6 +61,13 @@ def _format_embedded_html(html, img_buket_path):
     return _replace_eq_tags_in_table_html(_prefix_table_img_src(html, img_buket_path))
 
 
+def _normalize_text_content(content):
+    """将 VLM 文本 span 的空 content 规范为空字符串，再做全角转半角。"""
+    if content is None:
+        return ''
+    return full_to_half_exclude_marks(content)
+
+
 def _build_media_path(img_buket_path, image_path):
     if not image_path:
         return ''
@@ -245,7 +252,7 @@ def merge_para_with_text(
     for line in para_block['lines']:
         for span in line['spans']:
             if span['type'] in [ContentType.TEXT]:
-                span['content'] = full_to_half_exclude_marks(span['content'])
+                span['content'] = _normalize_text_content(span.get('content'))
                 block_text += span['content']
     block_lang = detect_lang(block_text)
     escape_markdown_text = para_block.get('type') != BlockType.CODE_BODY
@@ -768,7 +775,7 @@ def merge_para_with_text_v2(para_block):
     for line in para_block['lines']:
         for span in line['spans']:
             if span['type'] in [ContentType.TEXT]:
-                span['content'] = full_to_half_exclude_marks(span['content'])
+                span['content'] = _normalize_text_content(span.get('content'))
                 block_text += span['content']
     block_lang = detect_lang(block_text)
 

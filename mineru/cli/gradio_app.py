@@ -486,6 +486,67 @@ def replace_image_with_base64(markdown_text, image_dir_path):
     return result
 
 
+def _escape_latex_html_chars_for_gradio(content):
+    """转义公式内部会被 Gradio HTML 解析链路误判的尖括号，保留 LaTeX 对齐用 &。"""
+    return content.replace("<", "&lt;").replace(">", "&gt;")
+
+
+def escape_latex_blocks_for_gradio_preview(markdown_text, latex_delimiters):
+    """根据当前 LaTeX 分隔符，仅转义公式内容，避免影响公式外 Markdown/HTML。"""
+    if not markdown_text or not latex_delimiters:
+        return markdown_text
+
+    delimiter_pairs = []
+    for delimiter in latex_delimiters:
+        left = delimiter.get("left")
+        right = delimiter.get("right")
+        if left and right:
+            delimiter_pairs.append((left, right))
+    delimiter_pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    if not delimiter_pairs:
+        return markdown_text
+
+    result = []
+    position = 0
+    text_length = len(markdown_text)
+    while position < text_length:
+        matched_pair = None
+        for left, right in delimiter_pairs:
+            if markdown_text.startswith(left, position):
+                matched_pair = (left, right)
+                break
+
+        if matched_pair is None:
+            result.append(markdown_text[position])
+            position += 1
+            continue
+
+        left, right = matched_pair
+        content_start = position + len(left)
+        content_end = markdown_text.find(right, content_start)
+        if content_end == -1:
+            # 未闭合的分隔符保持原样，并继续扫描后续可能闭合的公式块。
+            result.append(markdown_text[position])
+            position += 1
+            continue
+
+        result.append(left)
+        result.append(
+            _escape_latex_html_chars_for_gradio(markdown_text[content_start:content_end])
+        )
+        result.append(right)
+        position = content_end + len(right)
+
+    return "".join(result)
+
+
+def prepare_markdown_for_gradio_preview(markdown_text, latex_delimiters):
+    """准备传给 gr.Markdown 的预览文本；原始 Markdown 文件内容不在这里改写。"""
+    if not isinstance(markdown_text, str):
+        return markdown_text
+    return escape_latex_blocks_for_gradio_preview(markdown_text, latex_delimiters)
+
+
 def normalize_language(language):
     if '(' in language and ')' in language:
         return language.split('(')[0].strip()
@@ -1254,6 +1315,12 @@ def main(ctx,
             url=url,
             api_url=api_url,
         ):
+            update = (
+                update[0],
+                update[1],
+                prepare_markdown_for_gradio_preview(update[2], latex_delimiters),
+                *update[3:],
+            )
             yield update
 
     suffixes = [f".{suffix}" for suffix in pdf_suffixes + image_suffixes + office_suffixes]

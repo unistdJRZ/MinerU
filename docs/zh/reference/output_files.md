@@ -429,6 +429,11 @@
 | `list` / `index` | 列表与索引，包含 `list_items` |
 | `page_header` / `page_footer` / `page_number` / `page_aside_text` / `page_footnote` | 页面辅助块 |
 
+`title_content`、`paragraph_content`、说明文字等行内内容通常由 span 列表组成。
+`hyperlink` span 包含 `content`、`url`，当同一个链接内存在多段不同样式文本时，
+还会包含 `children`；此时 `content` 是 children 文本的拼接，精确样式以
+`children` 中的 `text` span 为准。
+
 ##### 示例数据
 
 ```json

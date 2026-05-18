@@ -33,6 +33,18 @@ TEXT_QUALITY_MIN_CHARS = 300
 TEXT_QUALITY_BAD_THRESHOLD = 0.03
 TEXT_QUALITY_GOOD_THRESHOLD = 0.005
 MAX_PAGE_ASPECT_RATIO = 10.0
+SUSPICIOUS_CJK_72XX_START = 0x7280
+SUSPICIOUS_CJK_72XX_END = 0x72DF
+SUSPICIOUS_CJK_72XX_COUNT_THRESHOLD = 30
+SUSPICIOUS_CJK_72XX_CJK_RATIO_THRESHOLD = 0.026
+SUSPICIOUS_CJK_72XX_WHITELIST = set(
+    "犀犁犄犊犒犟犬犯状犷犹狂狄狈狐狗狙狞"
+)
+ASCII_PUNCT_CHARS = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+ASCII_PUNCT_RUN_MIN_LENGTH = 4
+SUSPICIOUS_ASCII_PUNCT_MIN_TEXT_CHARS = 100
+SUSPICIOUS_ASCII_PUNCT_RATIO_THRESHOLD = 0.25
+SUSPICIOUS_ASCII_PUNCT_RUN_RATIO_THRESHOLD = 0.10
 
 _ALLOWED_CONTROL_CODES = {9, 10, 13}
 _PRIVATE_USE_AREA_START = 0xE000
@@ -107,22 +119,23 @@ def classify_hybrid(pdf_bytes):
                 page_indices,
             )
             if extreme_page_index is not None:
-                logger.info(
+                logger.debug(
                     "Classify PDF as OCR due to extreme sampled-page aspect ratio: "
                     f"page={extreme_page_index + 1}, ratio={extreme_ratio:.2f}"
                 )
                 return "ocr"
 
-            if (
-                get_avg_cleaned_chars_per_page_pdfium(pdf, page_indices)
-                < CHARS_THRESHOLD
-            ):
+            text_samples = _collect_pdfium_text_samples(pdf, page_indices)
+            avg_cleaned_chars_per_page = _get_avg_cleaned_chars_per_page_from_samples(
+                text_samples
+            )
+            if avg_cleaned_chars_per_page < CHARS_THRESHOLD:
                 return "ocr"
 
             if detect_cid_font_signal_pypdf(pdf_bytes, page_indices):
                 return "ocr"
 
-            text_quality_signal = get_text_quality_signal_pdfium(pdf, page_indices)
+            text_quality_signal = _get_text_quality_signal_from_samples(text_samples)
             total_chars = text_quality_signal["total_chars"]
             abnormal_ratio = text_quality_signal["abnormal_ratio"]
 
@@ -132,6 +145,34 @@ def classify_hybrid(pdf_bytes):
                 should_run_pdfminer_fallback = abnormal_ratio > TEXT_QUALITY_GOOD_THRESHOLD
             else:
                 should_run_pdfminer_fallback = True
+
+            u72xx_signal = _get_u72xx_text_signal_from_samples(text_samples)
+            if (
+                u72xx_signal["u72xx_count"]
+                >= SUSPICIOUS_CJK_72XX_COUNT_THRESHOLD
+                and u72xx_signal["u72xx_cjk_ratio"]
+                >= SUSPICIOUS_CJK_72XX_CJK_RATIO_THRESHOLD
+            ):
+                logger.debug(
+                    "Classify PDF as OCR due to suspicious U+7280-U+72DF text: "
+                    f"count={u72xx_signal['u72xx_count']}, "
+                    f"cjk_ratio={u72xx_signal['u72xx_cjk_ratio']:.4f}"
+                )
+                return "ocr"
+
+            ascii_punct_signal = _get_sampled_ascii_punct_signal_from_samples(
+                text_samples
+            )
+            if ascii_punct_signal["triggered"]:
+                logger.debug(
+                    "Classify PDF as OCR due to suspicious sampled-page ASCII punctuation "
+                    f"text: page={ascii_punct_signal['page_index'] + 1}, "
+                    f"text_chars={ascii_punct_signal['cleaned_text_chars']}, "
+                    f"ascii_punct_ratio="
+                    f"{ascii_punct_signal['ascii_punct_ratio']:.4f}, "
+                    f"punct_run_ratio={ascii_punct_signal['punct_run_ratio']:.4f}"
+                )
+                return "ocr"
 
             if (
                 get_high_image_coverage_ratio_pdfium(pdf, page_indices)
@@ -260,30 +301,53 @@ def get_avg_cleaned_chars_per_page(pdf_doc, pages_to_check):
     return avg_cleaned_chars_per_page
 
 
-def get_avg_cleaned_chars_per_page_pdfium(pdf_doc, page_indices):
-    cleaned_total_chars = 0
+def _collect_pdfium_text_samples(pdf_doc, page_indices):
+    """一次性收集抽样页的 textpage 和文本，避免分类链路重复读取 PDFium 文本。"""
+    text_samples = []
 
     for page_index in page_indices:
         page = pdf_doc[page_index]
         text_page = page.get_textpage()
         text = text_page.get_text_bounded()
-        cleaned_total_chars += len(re.sub(r"\s+", "", text))
+        text_samples.append(
+            {
+                "page_index": page_index,
+                "text_page": text_page,
+                "text": text,
+                "cleaned_text": re.sub(r"\s+", "", text),
+            }
+        )
 
-    if not page_indices:
+    return text_samples
+
+
+def _get_avg_cleaned_chars_per_page_from_samples(text_samples):
+    """基于已缓存的抽样页文本计算平均有效字符数。"""
+    cleaned_total_chars = 0
+
+    for text_sample in text_samples:
+        cleaned_total_chars += len(text_sample["cleaned_text"])
+
+    if not text_samples:
         return 0.0
-    return cleaned_total_chars / len(page_indices)
+    return cleaned_total_chars / len(text_samples)
 
 
-def get_text_quality_signal_pdfium(pdf_doc, page_indices):
+def get_avg_cleaned_chars_per_page_pdfium(pdf_doc, page_indices):
+    text_samples = _collect_pdfium_text_samples(pdf_doc, page_indices)
+    return _get_avg_cleaned_chars_per_page_from_samples(text_samples)
+
+
+def _get_text_quality_signal_from_samples(text_samples):
+    """基于已缓存的 PDFium textpage 统计异常字符质量信号。"""
     total_chars = 0
     null_char_count = 0
     replacement_char_count = 0
     control_char_count = 0
     private_use_char_count = 0
 
-    for page_index in page_indices:
-        page = pdf_doc[page_index]
-        text_page = page.get_textpage()
+    for text_sample in text_samples:
+        text_page = text_sample["text_page"]
         char_count = text_page.count_chars()
         total_chars += char_count
 
@@ -317,6 +381,125 @@ def get_text_quality_signal_pdfium(pdf_doc, page_indices):
         "control_char_count": control_char_count,
         "private_use_char_count": private_use_char_count,
     }
+
+
+def get_text_quality_signal_pdfium(pdf_doc, page_indices):
+    text_samples = _collect_pdfium_text_samples(pdf_doc, page_indices)
+    return _get_text_quality_signal_from_samples(text_samples)
+
+
+def _get_u72xx_text_signal_from_samples(text_samples):
+    """基于已缓存的抽样页文本统计扣除常用字后的 U+7280-U+72DF 字符占比。"""
+    cjk_chars = 0
+    u72xx_count = 0
+
+    for text_sample in text_samples:
+        for char in text_sample["cleaned_text"]:
+            unicode_code = ord(char)
+            if 0x4E00 <= unicode_code <= 0x9FFF:
+                cjk_chars += 1
+            if (
+                SUSPICIOUS_CJK_72XX_START
+                <= unicode_code
+                <= SUSPICIOUS_CJK_72XX_END
+                and char not in SUSPICIOUS_CJK_72XX_WHITELIST
+            ):
+                u72xx_count += 1
+
+    u72xx_cjk_ratio = 0.0
+    if cjk_chars > 0:
+        u72xx_cjk_ratio = u72xx_count / cjk_chars
+
+    return {
+        "cjk_chars": cjk_chars,
+        "u72xx_count": u72xx_count,
+        "u72xx_cjk_ratio": u72xx_cjk_ratio,
+    }
+
+
+def get_u72xx_text_signal_pdfium(pdf_doc, page_indices):
+    """统计抽样页中扣除常用字后的 U+7280-U+72DF 字符占比，用于识别可疑 ToUnicode 映射。"""
+    text_samples = _collect_pdfium_text_samples(pdf_doc, page_indices)
+    return _get_u72xx_text_signal_from_samples(text_samples)
+
+
+def _count_ascii_punct_run_chars(text: str) -> int:
+    """统计连续 ASCII 标点字符数，仅累计长度达到阈值的 run。"""
+    run_chars = 0
+    current_run = 0
+
+    for char in text:
+        if char in ASCII_PUNCT_CHARS:
+            current_run += 1
+            continue
+
+        if current_run >= ASCII_PUNCT_RUN_MIN_LENGTH:
+            run_chars += current_run
+        current_run = 0
+
+    if current_run >= ASCII_PUNCT_RUN_MIN_LENGTH:
+        run_chars += current_run
+
+    return run_chars
+
+
+def _get_sampled_ascii_punct_signal_from_samples(text_samples):
+    """检查所有抽样页的 ASCII 标点密集度，用于识别无 ToUnicode 的乱码文本。"""
+    best_signal = {
+        "triggered": False,
+        "page_index": None,
+        "cleaned_text_chars": 0,
+        "ascii_punct_count": 0,
+        "ascii_punct_ratio": 0.0,
+        "ascii_punct_run_chars": 0,
+        "punct_run_ratio": 0.0,
+    }
+
+    for text_sample in text_samples:
+        page_index = text_sample.get("page_index")
+        cleaned_text = text_sample["cleaned_text"]
+        cleaned_text_chars = len(cleaned_text)
+        ascii_punct_count = sum(
+            1 for char in cleaned_text if char in ASCII_PUNCT_CHARS
+        )
+        ascii_punct_run_chars = _count_ascii_punct_run_chars(cleaned_text)
+
+        ascii_punct_ratio = 0.0
+        punct_run_ratio = 0.0
+        if cleaned_text_chars > 0:
+            ascii_punct_ratio = ascii_punct_count / cleaned_text_chars
+            punct_run_ratio = ascii_punct_run_chars / cleaned_text_chars
+
+        signal = {
+            "triggered": False,
+            "page_index": page_index,
+            "cleaned_text_chars": cleaned_text_chars,
+            "ascii_punct_count": ascii_punct_count,
+            "ascii_punct_ratio": ascii_punct_ratio,
+            "ascii_punct_run_chars": ascii_punct_run_chars,
+            "punct_run_ratio": punct_run_ratio,
+        }
+        if (
+            cleaned_text_chars >= SUSPICIOUS_ASCII_PUNCT_MIN_TEXT_CHARS
+            and ascii_punct_ratio >= SUSPICIOUS_ASCII_PUNCT_RATIO_THRESHOLD
+            and punct_run_ratio >= SUSPICIOUS_ASCII_PUNCT_RUN_RATIO_THRESHOLD
+        ):
+            signal["triggered"] = True
+            return signal
+
+        # 未触发时保留最可疑的抽样页指标，方便日志扩展和后续排查阈值边界。
+        if (
+            signal["punct_run_ratio"],
+            signal["ascii_punct_ratio"],
+            signal["cleaned_text_chars"],
+        ) > (
+            best_signal["punct_run_ratio"],
+            best_signal["ascii_punct_ratio"],
+            best_signal["cleaned_text_chars"],
+        ):
+            best_signal = signal
+
+    return best_signal
 
 
 def detect_cid_font_signal_pypdf(pdf_bytes, page_indices):

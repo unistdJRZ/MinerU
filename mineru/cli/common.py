@@ -1,4 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -732,7 +733,9 @@ async def aio_do_parse(
         image_analysis=True,
         **kwargs,
 ):
-    need_remove_index = _process_office_doc(
+    # Office 解析是同步且可能耗时的操作，异步入口需要放到线程中避免阻塞事件循环。
+    need_remove_index = await asyncio.to_thread(
+        _process_office_doc,
         output_dir,
         pdf_file_names=pdf_file_names,
         pdf_bytes_list=pdf_bytes_list,

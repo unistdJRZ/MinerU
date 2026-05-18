@@ -8,7 +8,7 @@ from mineru.utils.boxbase import calculate_overlap_area_in_bbox1_area_ratio
 from mineru.utils.enum_class import ContentType, BlockType, NotExtractType
 from mineru.utils.guess_suffix_or_lang import guess_language_by_text
 from mineru.utils.span_block_fix import fix_text_block
-from mineru.utils.span_pre_proc import txt_spans_extract
+from mineru.utils.span_pre_proc import SpanBlockMatcher, txt_spans_extract
 from mineru.utils.visual_magic_model_utils import (
     GENERIC_CHILD_TYPES,
     IMAGE_BLOCK_BODY,
@@ -16,6 +16,7 @@ from mineru.utils.visual_magic_model_utils import (
     clean_content,
     code_content_clean,
     fallback_inline_caption_fragments,
+    fallback_leading_table_continuation_captions,
     isolated_formula_clean,
     regroup_visual_blocks,
 )
@@ -90,6 +91,7 @@ class MagicModel:
                     [virtual_block],
                     [],
                 )
+        span_matcher = SpanBlockMatcher(page_text_inline_formula_spans)
 
         # 解析每个块
         for index, block_info in enumerate(self.page_blocks):
@@ -153,6 +155,10 @@ class MagicModel:
             elif block_type == "equation":
                 block_type = BlockType.INTERLINE_EQUATION
                 span_type = ContentType.INTERLINE_EQUATION
+
+            if span_type == ContentType.TEXT and block_content is None:
+                # 文本类块缺失 content 时按空文本处理，避免 VLM mkcontent 渲染阶段遇到 None。
+                block_content = ""
 
             # code 和 algorithm 类型的块，如果内容中包含行内公式，则需要将块类型切换为 algorithm
             switch_code_to_algorithm = False
@@ -285,20 +291,7 @@ class MagicModel:
                     block["cell_merge"] = block_info["cell_merge"]
                 _copy_raw_text_block_metadata(raw_block_type, block_info, block)
             else:
-                block_spans = []
-                for span in page_text_inline_formula_spans:
-                    if (
-                        calculate_overlap_area_in_bbox1_area_ratio(
-                            span["bbox"],
-                            block_bbox,
-                        )
-                        > 0.5
-                    ):
-                        block_spans.append(span)
-
-                if block_spans:
-                    for span in block_spans:
-                        page_text_inline_formula_spans.remove(span)
+                block_spans = span_matcher.collect_for_block(block_bbox)
 
                 block = {
                     "bbox": block_bbox,
@@ -313,6 +306,7 @@ class MagicModel:
             blocks.append(block)
 
         fallback_inline_caption_fragments(blocks, VISUAL_MAIN_TYPES)
+        fallback_leading_table_continuation_captions(blocks, VISUAL_MAIN_TYPES)
 
         self.image_blocks = []
         self.table_blocks = []

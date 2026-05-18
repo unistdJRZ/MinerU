@@ -10,8 +10,8 @@ from ...model.layout.pp_doclayoutv2 import PPDocLayoutV2LayoutModel
 from ...model.mfr.unimernet.Unimernet import UnimernetModel
 from ...model.mfr.pp_formulanet_plus_m.predict_formula import FormulaRecognizer
 from mineru.model.ocr.pytorch_paddle import PytorchPaddleOCR
-from ...model.ori_cls.paddle_ori_cls import PaddleOrientationClsModel
 from ...model.table.cls.paddle_table_cls import PaddleTableClsModel
+from ...model.table.cls.mineru_table_ori_cls import MineruTableOrientationClsModel
 from ...model.table.rec.slanet_plus.main import PaddleTableModel
 from ...model.table.rec.unet_table.main import UnetTableModel
 from ...utils.config_reader import get_device
@@ -30,7 +30,7 @@ else:
     MFR_MODEL = "unimernet_small"
 
 
-def img_orientation_cls_model_init():
+def table_orientation_cls_model_init():
     atom_model_manager = AtomModelSingleton()
     ocr_engine = atom_model_manager.get_atom_model(
         atom_model_name=AtomicModel.OCR,
@@ -39,7 +39,7 @@ def img_orientation_cls_model_init():
         lang="ch_lite",
         enable_merge_det_boxes=False
     )
-    cls_model = PaddleOrientationClsModel(ocr_engine)
+    cls_model = MineruTableOrientationClsModel(ocr_engine)
     return cls_model
 
 
@@ -183,8 +183,8 @@ def atom_model_init(model_name: str, **kwargs):
         )
     elif model_name == AtomicModel.TableCls:
         atom_model = table_cls_model_init()
-    elif model_name == AtomicModel.ImgOrientationCls:
-        atom_model = img_orientation_cls_model_init()
+    elif model_name == AtomicModel.TableOrientationCls:
+        atom_model = table_orientation_cls_model_init()
     else:
         logger.error('model name not allow')
         exit(1)
@@ -253,7 +253,7 @@ class MineruPipelineModel:
                 atom_model_name=AtomicModel.TableCls,
             )
             self.img_orientation_cls_model = atom_model_manager.get_atom_model(
-                atom_model_name=AtomicModel.ImgOrientationCls,
+                atom_model_name=AtomicModel.TableOrientationCls,
                 lang=self.lang,
             )
 

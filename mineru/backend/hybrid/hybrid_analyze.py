@@ -1,4 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import asyncio
 import os
 import time
 from collections import defaultdict
@@ -791,7 +792,8 @@ async def aio_doc_analyze(
                 f"speed: {round(len(model_list) / infer_time, 3)} page/s"
             )
 
-        finalize_middle_json(
+        await asyncio.to_thread(
+            finalize_middle_json,
             middle_json["pdf_info"],
             hybrid_pipeline_model,
             _ocr_enable,

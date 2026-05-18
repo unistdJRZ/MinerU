@@ -429,6 +429,12 @@ Text levels are distinguished through the `text_level` field:
 | `list` / `index` | List and index blocks with `list_items` |
 | `page_header` / `page_footer` / `page_number` / `page_aside_text` / `page_footnote` | Page auxiliary blocks |
 
+Inline fields such as `title_content`, `paragraph_content`, and captions are
+usually span lists. A `hyperlink` span contains `content` and `url`; when one
+link contains text fragments with different styles, it may also contain
+`children`. In that case, `content` is the concatenated child text, and the
+exact styles are represented by the child `text` spans.
+
 ##### Sample Data
 
 ```json

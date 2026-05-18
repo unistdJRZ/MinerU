@@ -9,9 +9,10 @@ from mineru.utils.enum_class import ContentType, BlockType
 from mineru.utils.guess_suffix_or_lang import guess_language_by_text
 from mineru.utils.span_block_fix import merge_spans_to_vertical_line, vertical_line_sort_spans_from_top_to_bottom, \
     merge_spans_to_line, line_sort_spans_by_left_to_right, is_vertical_text_block_by_spans
-from mineru.utils.span_pre_proc import txt_spans_extract
+from mineru.utils.span_pre_proc import SpanBlockMatcher, txt_spans_extract
 from mineru.utils.visual_magic_model_utils import (
     fallback_inline_caption_fragments,
+    fallback_leading_table_continuation_captions,
     find_best_visual_parent,
 )
 
@@ -121,6 +122,7 @@ class MagicModel:
         self.page_blocks.sort(key=lambda x: x["index"])
         self.__build_page_blocks()
         fallback_inline_caption_fragments(self.page_blocks, self.VISUAL_MAIN_TYPES)
+        fallback_leading_table_continuation_captions(self.page_blocks, self.VISUAL_MAIN_TYPES)
         self.__classify_visual_blocks()
         self.__build_return_blocks()
 
@@ -206,6 +208,7 @@ class MagicModel:
 
     def __build_page_blocks(self):
         span_type = "unknown"
+        span_matcher = SpanBlockMatcher(self.page_text_inline_formula_spans)
         for block in self.page_blocks:
             if block["type"] in [
                 BlockType.ABSTRACT,
@@ -265,28 +268,25 @@ class MagicModel:
                 block["lines"] = [line]
             else:
                 # span填充
-                block_spans = []
-                for span in self.page_text_inline_formula_spans:
-                    overlap_ratio = calculate_overlap_area_in_bbox1_area_ratio(
-                        span['bbox'], block["bbox"]
+                if block["type"] == BlockType.FORMULA_NUMBER:
+                    block_spans = span_matcher.collect_for_block(
+                        block["bbox"],
+                        overlap_ratio_getter=self.__formula_number_overlap_ratio,
                     )
-                    if block["type"] == BlockType.FORMULA_NUMBER:
-                        # OCR 检测框通常会比公式编号框更大，使用最小框重叠比避免编号文字无法回填。
-                        overlap_ratio = max(
-                            overlap_ratio,
-                            calculate_overlap_area_2_minbox_area_ratio(
-                                span['bbox'], block["bbox"]
-                            ),
-                        )
-                    if overlap_ratio > 0.5:
-                        block_spans.append(span)
-                # 从spans删除已经放入block_spans中的span
-                if len(block_spans) > 0:
-                    for span in block_spans:
-                        self.page_text_inline_formula_spans.remove(span)
+                else:
+                    block_spans = span_matcher.collect_for_block(block["bbox"])
 
                 block["spans"] = block_spans
                 block = self.__fix_text_block(block)
+        self.page_text_inline_formula_spans = span_matcher.remaining_spans()
+
+    @staticmethod
+    def __formula_number_overlap_ratio(span, block_bbox):
+        """公式编号框较窄时，沿用最小框重叠比例提高回填召回。"""
+        return max(
+            calculate_overlap_area_in_bbox1_area_ratio(span['bbox'], block_bbox),
+            calculate_overlap_area_2_minbox_area_ratio(span['bbox'], block_bbox),
+        )
 
     def __fix_axis(self):
         need_remove_list = []
