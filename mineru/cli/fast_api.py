@@ -1081,7 +1081,7 @@ async def parse_request_form(
     return_middle_json: Annotated[
         bool,
         Form(description="Return middle JSON in response"),
-    ] = False,
+    ] = True,
     return_model_output: Annotated[
         bool,
         Form(description="Return model output JSON in response"),
@@ -1093,7 +1093,7 @@ async def parse_request_form(
     return_images: Annotated[
         bool,
         Form(description="Return extracted images in response"),
-    ] = False,
+    ] = True,
     response_format_zip: Annotated[
         bool,
         Form(description="Return results as a ZIP file instead of JSON"),
