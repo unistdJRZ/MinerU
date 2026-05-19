@@ -72,6 +72,7 @@ FILE_PARSE_TASK_STATUS_URL_HEADER = "X-MinerU-Task-Status-Url"
 FILE_PARSE_TASK_RESULT_URL_HEADER = "X-MinerU-Task-Result-Url"
 HEALTH_ENDPOINT = "/health"
 TASKS_ENDPOINT = "/tasks"
+CONTENT_ENDPOINT = "/content"
 SOURCE_LOCAL = "local"
 SOURCE_REMOTE = "remote"
 LOCAL_GPU_AUTO = "auto"
@@ -1560,6 +1561,52 @@ async def fetch_router_task_result_payload(
         raise HTTPException(status_code=502, detail=detail) from exc
 
 
+async def fetch_router_compat_content_payload(
+    request: Request,
+    task: RouterTaskRecord,
+) -> tuple[int, dict[str, Any]]:
+    client: httpx.AsyncClient = request.app.state.http_client
+    content_url = f"{task.upstream_base_url}{CONTENT_ENDPOINT}"
+    try:
+        response = await client.get(
+            content_url,
+            params={"ocr_id": task.upstream_task_id},
+            timeout=build_result_download_timeout(),
+        )
+    except httpx.HTTPError as exc:
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        detail = "content_router requires an upstream JSON /content response"
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            detail,
+        )
+        raise HTTPException(status_code=502, detail=detail)
+
+    try:
+        payload = _parse_json_object_response(response, "content payload")
+    except ValueError as exc:
+        detail = f"Invalid content payload: {exc}"
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            detail,
+        )
+        raise HTTPException(status_code=502, detail=detail) from exc
+
+    if response.status_code >= 500:
+        await request.app.state.router_task_registry.increment_upstream_error(
+            task.task_id,
+            f"{response.status_code} {response_detail(response)}",
+        )
+    return response.status_code, payload
+
+
 def build_sync_task_headers(task: RouterTaskRecord, request: Request) -> dict[str, str]:
     payload = task.to_status_payload(request)
     return {
@@ -1739,38 +1786,11 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
                     content={"error": f"ocr_id not found: {ocr_id}"},
                 )
 
-        task = await fetch_router_task_status(request, task)
-        if task.status in (TASK_PENDING, TASK_PROCESSING):
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": COMPAT_STATUS_BY_TASK_STATUS[task.status],
-                    "content": None,
-                },
-            )
-
-        if task.status == TASK_FAILED:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": COMPAT_STATUS_FAIL,
-                    "content": {"error": task.error} if task.error else None,
-                },
-            )
-
-        result_payload = await fetch_router_task_result_payload(request, task)
-        content = {
-            "backend": result_payload.get("backend", task.backend),
-            "version": result_payload.get("version", __version__),
-            "results": result_payload.get("results", {}),
-        }
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": COMPAT_STATUS_FINISHED,
-                "content": content,
-            },
+        status_code, content_payload = await fetch_router_compat_content_payload(
+            request,
+            task,
         )
+        return JSONResponse(status_code=status_code, content=content_payload)
 
     @app.get(path="/health")
     async def health_check(request: Request):
