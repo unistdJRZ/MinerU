@@ -26,8 +26,6 @@ from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from mineru.cli.api_client import (
-    LOCAL_API_CLEANUP_RETRIES,
-    LOCAL_API_CLEANUP_RETRY_INTERVAL_SECONDS,
     LOCAL_API_STARTUP_TIMEOUT_SECONDS,
     TASK_RESULT_TIMEOUT_SECONDS,
     TASK_STATUS_POLL_INTERVAL_SECONDS,
@@ -159,25 +157,6 @@ def cleanup_path(path: str) -> None:
         return
     except Exception as exc:
         logger.warning("Failed to clean up {}: {}", path, exc)
-
-
-def cleanup_temporary_directory(temp_dir: tempfile.TemporaryDirectory[str]) -> None:
-    last_error: Exception | None = None
-    for attempt in range(LOCAL_API_CLEANUP_RETRIES):
-        try:
-            temp_dir.cleanup()
-            return
-        except FileNotFoundError:
-            return
-        except Exception as exc:
-            last_error = exc
-            if attempt + 1 < LOCAL_API_CLEANUP_RETRIES:
-                import time
-
-                time.sleep(LOCAL_API_CLEANUP_RETRY_INTERVAL_SECONDS)
-
-    if last_error is not None:
-        logger.warning("Failed to clean up temporary directory {}: {}", temp_dir.name, last_error)
 
 
 def parse_json_env(name: str, default: Sequence[str] = ()) -> tuple[str, ...]:
@@ -405,7 +384,6 @@ class ManagedLocalServer:
     base_url: str | None = None
     process: subprocess.Popen[bytes] | None = None
     process_group_id: int | None = None
-    temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
     def __post_init__(self) -> None:
         self.connect_host = resolve_connect_host(self.worker_host)
@@ -417,10 +395,6 @@ class ManagedLocalServer:
         if self.is_running():
             return
 
-        self.temp_dir = tempfile.TemporaryDirectory(prefix=f"{self.server_id}-")
-        output_root = Path(self.temp_dir.name) / "output"
-        output_root.mkdir(parents=True, exist_ok=True)
-
         resolved_port = port if port is not None else find_free_port()
         remaining_cli_args = strip_local_api_network_args(self.extra_cli_args)
         worker_cli_args = build_local_api_cli_args(
@@ -428,6 +402,9 @@ class ManagedLocalServer:
             enable_vlm_preload=self.enable_vlm_preload,
         )
         self.base_url = f"http://{self.connect_host}:{resolved_port}"
+        output_base = Path(os.getenv("MINERU_API_OUTPUT_ROOT", "./output")).expanduser()
+        output_root = (output_base / "router-workers" / self.server_id).resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["MINERU_API_OUTPUT_ROOT"] = str(output_root)
         env["MINERU_API_DISABLE_ACCESS_LOG"] = "1"
@@ -501,11 +478,7 @@ class ManagedLocalServer:
                     use_stdin_shutdown_watcher=False,
                 )
         finally:
-            temp_dir = self.temp_dir
-            self.temp_dir = None
             self.base_url = None
-            if temp_dir is not None:
-                cleanup_temporary_directory(temp_dir)
 
 
 @dataclass
@@ -1290,7 +1263,7 @@ async def submit_router_task(
                 else []
             )
             return await registry.register(
-                task_id=task_id,
+                task_id=task_id or upstream_payload["task_id"],
                 upstream_server_id=server.server_id,
                 upstream_base_url=server.base_url,
                 upstream_task_id=upstream_payload["task_id"],
@@ -1353,6 +1326,51 @@ async def fetch_router_task_status(
     if updated is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return updated
+
+
+async def recover_router_task_from_upstream(
+    request: Request,
+    task_id: str,
+) -> RouterTaskRecord | None:
+    worker_pool: WorkerPool = request.app.state.worker_pool
+    registry: RouterTaskRegistry = request.app.state.router_task_registry
+    client: httpx.AsyncClient = request.app.state.http_client
+
+    for server in worker_pool.servers:
+        if not server.healthy:
+            continue
+        try:
+            response = await client.get(f"{server.base_url}{TASKS_ENDPOINT}/{task_id}")
+        except httpx.HTTPError:
+            continue
+        if response.status_code != 200:
+            continue
+        try:
+            payload = _parse_json_object_response(response, "task status payload")
+            parsed = parse_submit_response(payload)
+        except ValueError:
+            continue
+        file_names = parsed["file_names"]
+        normalized_file_names = (
+            list(file_names)
+            if isinstance(file_names, list) and all(isinstance(item, str) for item in file_names)
+            else []
+        )
+        return await registry.register(
+            task_id=task_id,
+            upstream_server_id=server.server_id,
+            upstream_base_url=server.base_url,
+            upstream_task_id=parsed["task_id"],
+            backend=parsed["backend"],
+            file_names=normalized_file_names,
+            created_at=parsed["created_at"],
+            status=parsed["status"],
+            started_at=parsed["started_at"] if isinstance(parsed["started_at"], str) else None,
+            completed_at=parsed["completed_at"] if isinstance(parsed["completed_at"], str) else None,
+            error=parsed["error"] if isinstance(parsed["error"], str) else None,
+            queued_ahead=parsed["queued_ahead"],
+        )
+    return None
 
 
 async def wait_for_router_task_terminal_state(
@@ -1714,10 +1732,12 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         registry: RouterTaskRegistry = request.app.state.router_task_registry
         task = await registry.get(ocr_id)
         if task is None:
-            return JSONResponse(
-                status_code=404,
-                content={"error": f"ocr_id not found: {ocr_id}"},
-            )
+            task = await recover_router_task_from_upstream(request, ocr_id)
+            if task is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"ocr_id not found: {ocr_id}"},
+                )
 
         task = await fetch_router_task_status(request, task)
         if task.status in (TASK_PENDING, TASK_PROCESSING):

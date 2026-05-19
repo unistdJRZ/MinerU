@@ -101,6 +101,12 @@ COMPAT_STATUS_BY_TASK_STATUS = {
     TASK_COMPLETED: COMPAT_STATUS_FINISHED,
     TASK_FAILED: COMPAT_STATUS_FAIL,
 }
+TASK_STATUS_BY_COMPAT_STATUS = {
+    COMPAT_STATUS_PENDING: TASK_PENDING,
+    COMPAT_STATUS_RUNNING: TASK_PROCESSING,
+    COMPAT_STATUS_FINISHED: TASK_COMPLETED,
+    COMPAT_STATUS_FAIL: TASK_FAILED,
+}
 SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
 RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
@@ -163,6 +169,7 @@ def install_stdin_shutdown_watcher(server: uvicorn.Server) -> None:
 @dataclass
 class ParseRequestOptions:
     files: list[UploadFile]
+    ocr_id: Optional[str]
     lang_list: list[str]
     backend: str
     parse_method: str
@@ -739,6 +746,25 @@ def build_compat_job_content(job: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
+def build_persisted_task_status_payload(
+    job: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    task_id = job.get("task_id") or job["ocr_id"]
+    return {
+        "task_id": task_id,
+        "status": TASK_STATUS_BY_COMPAT_STATUS.get(job["status"], TASK_FAILED),
+        "backend": job["backend"],
+        "file_names": job["response_pdf_file_names"],
+        "created_at": job["created_at"],
+        "started_at": None,
+        "completed_at": job["completed_at"],
+        "error": job.get("error_message"),
+        "status_url": str(request.url_for("get_async_task_status", task_id=task_id)),
+        "result_url": str(request.url_for("get_async_task_result", task_id=task_id)),
+    }
+
+
 def build_zip_arcname(
     pdf_name: str,
     parse_dir: str,
@@ -1011,6 +1037,10 @@ async def parse_request_form(
             json_schema_extra=SWAGGER_UI_FILE_ARRAY_SCHEMA_EXTRA,
         ),
     ],
+    ocr_id: Annotated[
+        Optional[str],
+        Form(description="Optional task id used by router-compatible clients."),
+    ] = None,
     lang_list: Annotated[
         list[str],
         Form(
@@ -1127,8 +1157,12 @@ async def parse_request_form(
         server_url=server_url,
     )
     effective_return_original_file = return_original_file and response_format_zip
+    normalized_ocr_id = ocr_id.strip() if ocr_id is not None else None
+    if normalized_ocr_id == "":
+        raise HTTPException(status_code=400, detail="ocr_id cannot be empty")
     return ParseRequestOptions(
         files=files,
+        ocr_id=normalized_ocr_id,
         lang_list=lang_list,
         backend=backend,
         parse_method=validate_parse_method(parse_method),
@@ -1275,15 +1309,57 @@ def create_task_output_dir(task_id: str) -> str:
 async def create_async_parse_task(
     request_options: ParseRequestOptions,
 ) -> AsyncParseTask:
-    task_id = str(uuid.uuid4())
+    task_id = request_options.ocr_id or str(uuid.uuid4())
+    task_manager = get_task_manager()
+    existing_task = task_manager.get(task_id)
+    if existing_task is not None and not is_task_terminal(existing_task.status):
+        existing_task.status = TASK_FAILED
+        existing_task.error = "Overwritten by a new /tasks request"
+        existing_task.completed_at = utc_now_iso()
+        existing_event = task_manager.task_events.get(task_id)
+        if existing_event is not None:
+            existing_event.set()
+
+    job_store = get_job_store()
+    existing_job = job_store.get_job(task_id)
+    if existing_job is not None:
+        old_output_dir = existing_job.get("unique_dir") or existing_job.get("output_dir")
+        if old_output_dir:
+            cleanup_file(old_output_dir)
+
     task_output_dir = create_task_output_dir(task_id)
     uploads_dir = os.path.join(task_output_dir, "uploads")
-    task_manager = get_task_manager()
+    config = dict(getattr(app.state, "config", {}))
 
     try:
         uploads = await save_upload_files(uploads_dir, request_options.files)
         request_options.files.clear()
         file_names = [upload.stem for upload in uploads]
+        pdf_hashes, file_suffixes = await asyncio.to_thread(
+            load_compat_upload_metadata,
+            uploads,
+        )
+        result_hash = build_compat_result_hash(
+            pdf_hashes=pdf_hashes,
+            request_options=request_options,
+            config=config,
+        )
+        job_store.create_job(
+            build_compat_job_record(
+                ocr_id=task_id,
+                source_ocr_id=None,
+                result_hash=result_hash,
+                status=COMPAT_STATUS_PENDING,
+                output_dir=task_output_dir,
+                source_file_names=file_names,
+                response_file_names=file_names,
+                uploads=uploads,
+                pdf_hashes=pdf_hashes,
+                file_suffixes=file_suffixes,
+                request_options=request_options,
+                config=config,
+            )
+        )
         task = AsyncParseTask(
             task_id=task_id,
             status=TASK_PENDING,
@@ -1324,6 +1400,7 @@ def build_compat_parse_options(files: list[UploadFile]) -> ParseRequestOptions:
     # needed by the legacy /content response.
     return ParseRequestOptions(
         files=files,
+        ocr_id=None,
         lang_list=["ch"],
         backend="vlm-auto-engine",
         parse_method="auto",
@@ -2023,7 +2100,10 @@ async def get_async_task_status(task_id: str, request: Request):
     task_manager = get_task_manager()
     task = task_manager.get(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        job_info = get_job_store().get_job(task_id)
+        if job_info is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return build_persisted_task_status_payload(job_info, request)
     return task_manager.build_status_payload(task, request)
 
 
@@ -2036,7 +2116,42 @@ async def get_async_task_result(
     task_manager = get_task_manager()
     task = task_manager.get(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        job_info = get_job_store().get_job(task_id)
+        if job_info is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        status = TASK_STATUS_BY_COMPAT_STATUS.get(job_info["status"], TASK_FAILED)
+        if status in (TASK_PENDING, TASK_PROCESSING):
+            return JSONResponse(
+                status_code=202,
+                content={
+                    **build_persisted_task_status_payload(job_info, request),
+                    "message": "Task result is not ready yet",
+                },
+            )
+        if status == TASK_FAILED:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    **build_persisted_task_status_payload(job_info, request),
+                    "message": "Task execution failed",
+                },
+            )
+        return await build_result_response(
+            background_tasks=background_tasks,
+            status_code=200,
+            output_dir=job_info["unique_dir"],
+            pdf_file_names=job_info["source_pdf_file_names"],
+            backend=job_info["backend"],
+            parse_method=job_info["parse_method"],
+            return_md=job_info["return_md"],
+            return_middle_json=job_info["return_middle_json"],
+            return_model_output=job_info["return_model_output"],
+            return_content_list=job_info["return_content_list"],
+            return_images=job_info["return_images"],
+            response_format_zip=False,
+            return_original_file=False,
+            zip_filename=f"{task_id}.zip",
+        )
 
     if task.status in (TASK_PENDING, TASK_PROCESSING):
         return JSONResponse(
