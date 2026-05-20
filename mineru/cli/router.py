@@ -1,6 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import asyncio
 import json
+import mimetypes
 import os
 import random
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from base64 import b64encode
 from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ from mineru.cli.api_client import (
     response_detail,
 )
 from mineru.cli.api_protocol import API_PROTOCOL_VERSION
+from mineru.cli.job_store import JobStore
 from mineru.cli.common import normalize_upload_filename
 from mineru.cli.public_http_client_policy import (
     configure_public_http_client_policy,
@@ -84,6 +87,16 @@ WORKER_HEALTH_FAILURE_RESTART_THRESHOLD = 5
 MIN_HEALTHY_PROCESSING_WINDOW_SIZE = 1
 MINERU_ROUTER_PUBLIC_BIND_EXPOSED_ENV = "MINERU_ROUTER_PUBLIC_BIND_EXPOSED"
 MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT_ENV = "MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT"
+RESULT_IMAGE_SUFFIXES = {
+    "jpg",
+    "jpeg",
+    "png",
+    "bmp",
+    "tiff",
+    "tif",
+    "webp",
+    "svg",
+}
 
 
 def utc_now_iso() -> str:
@@ -158,6 +171,118 @@ def cleanup_path(path: str) -> None:
         return
     except Exception as exc:
         logger.warning("Failed to clean up {}: {}", path, exc)
+
+
+def get_router_output_base() -> Path:
+    return Path(
+        os.path.expandvars(os.getenv("MINERU_API_OUTPUT_ROOT", "./output"))
+    ).expanduser().resolve()
+
+
+def get_router_worker_output_root(server_id: str) -> Path:
+    return get_router_output_base() / "router-workers" / server_id
+
+
+def get_image_mime_type(image_path: str) -> str:
+    mime_type, _ = mimetypes.guess_type(image_path)
+    return mime_type or "image/jpeg"
+
+
+def encode_image(image_path: str) -> str:
+    with open(image_path, "rb") as handle:
+        return b64encode(handle.read()).decode()
+
+
+def get_images_dir_image_paths(images_dir: str) -> list[str]:
+    image_root = Path(images_dir)
+    if not image_root.is_dir():
+        return []
+    return sorted(
+        str(path)
+        for path in image_root.iterdir()
+        if path.is_file() and path.suffix.lstrip(".").lower() in RESULT_IMAGE_SUFFIXES
+    )
+
+
+def get_result_text(file_suffix_identifier: str, pdf_name: str, parse_dir: str) -> str | None:
+    result_file_path = Path(parse_dir) / f"{pdf_name}{file_suffix_identifier}"
+    if not result_file_path.exists():
+        return None
+    return result_file_path.read_text(encoding="utf-8")
+
+
+def get_parse_dir(output_dir: str, pdf_name: str, backend: str, parse_method: str) -> str:
+    output_root = Path(output_dir)
+    if backend.startswith("pipeline"):
+        return str(output_root / pdf_name / parse_method)
+    if backend.startswith("vlm"):
+        return str(output_root / pdf_name / "vlm")
+    if backend.startswith("hybrid"):
+        return str(output_root / pdf_name / f"hybrid_{parse_method}")
+    return str(output_root / pdf_name / "office")
+
+
+def build_persisted_content_payload(job: dict[str, Any]) -> dict[str, Any] | None:
+    if job["status"] == COMPAT_STATUS_FAIL:
+        if job.get("content") is not None:
+            return job["content"]
+        if job.get("error_message"):
+            return {"error": job["error_message"]}
+        return {"error": "Task execution failed"}
+
+    if job["status"] != COMPAT_STATUS_FINISHED:
+        return None
+
+    if job.get("content") is not None:
+        return job["content"]
+
+    result_dict: dict[str, dict[str, Any]] = {}
+    source_names = job["source_pdf_file_names"]
+    response_names = job.get("response_pdf_file_names") or source_names
+    if len(response_names) != len(source_names):
+        response_names = source_names
+
+    for source_name, response_name in zip(source_names, response_names):
+        parse_dir = get_parse_dir(
+            job["unique_dir"],
+            source_name,
+            job["backend"],
+            job["parse_method"],
+        )
+        if not os.path.exists(parse_dir):
+            return {"error": "Persisted result files are missing and the response cannot be rebuilt"}
+
+        data: dict[str, Any] = {}
+        data["md_content"] = get_result_text(".md", source_name, parse_dir)
+        middle_json_text = get_result_text("_middle.json", source_name, parse_dir)
+        if middle_json_text is not None:
+            try:
+                data["middle_json"] = json.loads(middle_json_text)
+            except json.JSONDecodeError:
+                data["middle_json"] = None
+
+        images_dir = os.path.join(parse_dir, "images")
+        image_paths = get_images_dir_image_paths(images_dir)
+        data["images"] = {
+            os.path.basename(image_path): (
+                f"data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)}"
+            )
+            for image_path in image_paths
+        }
+        result_dict[response_name] = data
+
+    return {
+        "backend": job["backend"],
+        "version": __version__,
+        "results": result_dict,
+    }
+
+
+def build_persisted_content_response_payload(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": job["status"],
+        "content": build_persisted_content_payload(job),
+    }
 
 
 def parse_json_env(name: str, default: Sequence[str] = ()) -> tuple[str, ...]:
@@ -403,10 +528,7 @@ class ManagedLocalServer:
             enable_vlm_preload=self.enable_vlm_preload,
         )
         self.base_url = f"http://{self.connect_host}:{resolved_port}"
-        output_base = Path(
-            os.path.expandvars(os.getenv("MINERU_API_OUTPUT_ROOT", "./output"))
-        ).expanduser()
-        output_root = (output_base / "router-workers" / self.server_id).resolve()
+        output_root = get_router_worker_output_root(self.server_id)
         output_root.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["MINERU_API_OUTPUT_ROOT"] = str(output_root)
@@ -1376,6 +1498,26 @@ async def recover_router_task_from_upstream(
     return None
 
 
+def find_persisted_router_job(worker_pool: WorkerPool, task_id: str) -> dict[str, Any] | None:
+    db_paths: list[Path] = [get_router_output_base() / "mineru_jobs.sqlite3"]
+    for server in worker_pool.servers:
+        if server.source != SOURCE_LOCAL:
+            continue
+        db_paths.append(get_router_worker_output_root(server.server_id) / "mineru_jobs.sqlite3")
+
+    for db_path in dict.fromkeys(db_paths):
+        if not db_path.exists():
+            continue
+        try:
+            job = JobStore(str(db_path)).get_job(task_id)
+        except Exception as exc:
+            logger.warning("Failed to read persisted router job from {}: {}", db_path, exc)
+            continue
+        if job is not None:
+            return job
+    return None
+
+
 async def wait_for_router_task_terminal_state(
     request: Request,
     task: RouterTaskRecord,
@@ -1584,6 +1726,7 @@ async def fetch_router_compat_content_payload(
                 current_task.task_id,
                 str(exc),
             )
+            worker_pool: WorkerPool = request.app.state.worker_pool
             if not recovered_after_failure:
                 recovered_after_failure = True
                 recovered = await recover_router_task_from_upstream(
@@ -1599,9 +1742,13 @@ async def fetch_router_compat_content_payload(
                 ):
                     current_task = recovered
                     continue
+            job = find_persisted_router_job(worker_pool, current_task.task_id)
+            if job is not None:
+                return 200, build_persisted_content_response_payload(job)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         if response.status_code == 404 and not recovered_after_failure:
+            worker_pool: WorkerPool = request.app.state.worker_pool
             recovered_after_failure = True
             recovered = await recover_router_task_from_upstream(
                 request,
@@ -1616,6 +1763,9 @@ async def fetch_router_compat_content_payload(
             ):
                 current_task = recovered
                 continue
+            job = find_persisted_router_job(worker_pool, current_task.task_id)
+            if job is not None:
+                return 200, build_persisted_content_response_payload(job)
         break
 
     content_type = response.headers.get("content-type", "")
@@ -1814,21 +1964,17 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
 
     @app.get(path="/content_router")
     async def get_parse_content_router(ocr_id: str, request: Request):
-        registry: RouterTaskRegistry = request.app.state.router_task_registry
-        task = await registry.get(ocr_id)
-        if task is None:
-            task = await recover_router_task_from_upstream(request, ocr_id)
-            if task is None:
-                return JSONResponse(
-                    status_code=404,
-                    content={"error": f"ocr_id not found: {ocr_id}"},
-                )
-
-        status_code, content_payload = await fetch_router_compat_content_payload(
-            request,
-            task,
+        worker_pool: WorkerPool = request.app.state.worker_pool
+        job = find_persisted_router_job(worker_pool, ocr_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"ocr_id not found: {ocr_id}"},
+            )
+        return JSONResponse(
+            status_code=200,
+            content=build_persisted_content_response_payload(job),
         )
-        return JSONResponse(status_code=status_code, content=content_payload)
 
     @app.get(path="/health")
     async def health_check(request: Request):

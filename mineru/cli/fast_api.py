@@ -1905,12 +1905,37 @@ class AsyncTaskManager:
         task.status = TASK_COMPLETED
         task.completed_at = utc_now_iso()
         try:
-            get_job_store_for_app(self.app).update_job(
-                task.task_id,
-                status=COMPAT_STATUS_FINISHED,
-            )
+            job_store = get_job_store_for_app(self.app)
+            job_info = job_store.get_job(task.task_id)
+            content = None
+            if job_info is not None:
+                completed_job_info = dict(job_info)
+                completed_job_info["status"] = COMPAT_STATUS_FINISHED
+                content = build_compat_job_content(completed_job_info)
+            if isinstance(content, dict) and "error" in content:
+                job_store.update_job(
+                    task.task_id,
+                    status=COMPAT_STATUS_FAIL,
+                    content=content,
+                    error_message=content["error"],
+                )
+            else:
+                job_store.update_job(
+                    task.task_id,
+                    status=COMPAT_STATUS_FINISHED,
+                    content=content,
+                )
         except Exception as store_exc:
             logger.warning(f"Failed to persist completed task {task.task_id}: {store_exc}")
+            try:
+                get_job_store_for_app(self.app).update_job(
+                    task.task_id,
+                    status=COMPAT_STATUS_FINISHED,
+                )
+            except Exception as fallback_store_exc:
+                logger.warning(
+                    f"Failed to persist completed task fallback {task.task_id}: {fallback_store_exc}"
+                )
         self._signal_task_event(task.task_id)
 
     def cleanup_expired_tasks(self) -> int:
@@ -1931,8 +1956,7 @@ class AsyncTaskManager:
             task_event = self.task_events.pop(task_id, None)
             if task_event is not None:
                 task_event.set()
-            cleanup_file(task.output_dir)
-            logger.info(f"Cleaned expired async task: {task_id}")
+            logger.info(f"Cleaned expired async task from memory: {task_id}")
         return len(expired_task_ids)
 
     def _is_task_expired(self, task: AsyncParseTask, now: datetime) -> bool:
@@ -1955,7 +1979,6 @@ def get_task_manager() -> AsyncTaskManager:
     if task_manager is None:
         raise HTTPException(status_code=503, detail="Task manager is not initialized")
     return task_manager
-
 
 @app.post(
     path="/file_parse_sync",
@@ -2195,35 +2218,13 @@ async def get_async_task_result(
 async def get_parse_content(ocr_id: str):
     job_store = get_job_store()
     job_info = job_store.get_job(ocr_id)
-    task_manager = getattr(app.state, "task_manager", None)
-    task = task_manager.get(ocr_id) if task_manager is not None else None
-
-    if job_info is None and task is None:
+    if job_info is None:
         return JSONResponse(
             status_code=404,
             content={"error": f"ocr_id not found: {ocr_id}"},
         )
 
-    if job_info is None and task is not None:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": COMPAT_STATUS_BY_TASK_STATUS.get(task.status, COMPAT_STATUS_FAIL),
-                "content": {"error": task.error} if task.error else None,
-            },
-        )
-
-    if task is not None and task.status in (TASK_PENDING, TASK_PROCESSING):
-        status = COMPAT_STATUS_BY_TASK_STATUS[task.status]
-        return JSONResponse(status_code=200, content={"status": status, "content": None})
-
     effective_job_info = dict(job_info)
-    if task is not None and task.status == TASK_COMPLETED:
-        effective_job_info["status"] = COMPAT_STATUS_FINISHED
-    elif task is not None and task.status == TASK_FAILED:
-        effective_job_info["status"] = COMPAT_STATUS_FAIL
-        effective_job_info["error_message"] = task.error or job_info.get("error_message")
-
     content = build_compat_job_content(effective_job_info)
     status = effective_job_info["status"]
     if status == COMPAT_STATUS_FINISHED and isinstance(content, dict) and "error" in content:
