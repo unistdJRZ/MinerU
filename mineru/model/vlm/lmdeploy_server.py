@@ -4,7 +4,7 @@ import sys
 
 from loguru import logger
 
-from mineru.backend.vlm.utils import set_lmdeploy_backend
+from mineru.backend.vlm.utils import set_default_lmdeploy_cache_max_entry_count, set_lmdeploy_backend
 from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
 
 
@@ -50,7 +50,7 @@ def main():
     if not has_port_arg:
         args.extend(["--server-port", "30000"])
     if not has_gpu_memory_utilization_arg:
-        args.extend(["--cache-max-entry-count", "0.5"])
+        args.extend(["--cache-max-entry-count", str(set_default_lmdeploy_cache_max_entry_count())])
     if not has_log_level_arg:
         args.extend(["--log-level", "ERROR"])
 

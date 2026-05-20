@@ -72,5 +72,5 @@ def load_dotenv_if_present() -> None:
                 if item is None:
                     continue
                 key, value = item
-                os.environ.setdefault(key, value)
+                os.environ.setdefault(key, os.path.expandvars(value))
         return

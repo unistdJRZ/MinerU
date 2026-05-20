@@ -393,7 +393,9 @@ def get_task_cleanup_interval_seconds() -> int:
 
 
 def get_output_root() -> Path:
-    root = Path(os.getenv("MINERU_API_OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT)).expanduser()
+    root = Path(
+        os.path.expandvars(os.getenv("MINERU_API_OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
+    ).expanduser()
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
 

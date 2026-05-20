@@ -81,6 +81,19 @@ def set_lmdeploy_backend(device_type: str) -> str:
 
 
 def set_default_gpu_memory_utilization() -> float:
+    env_value = os.getenv("MINERU_VLLM_GPU_MEMORY_UTILIZATION")
+    if env_value is not None:
+        try:
+            configured_value = float(env_value)
+            if 0 < configured_value < 1:
+                logger.info(f"vLLM gpu_memory_utilization (from env): {configured_value}")
+                return configured_value
+        except ValueError:
+            pass
+        logger.warning(
+            f"Invalid MINERU_VLLM_GPU_MEMORY_UTILIZATION value: {env_value}, using auto default"
+        )
+
     from vllm import __version__ as vllm_version
     device = get_device()
     gpu_memory = get_vram(device)
@@ -92,7 +105,34 @@ def set_default_gpu_memory_utilization() -> float:
     return default_gpu_memory_utilization
 
 
+def set_default_lmdeploy_cache_max_entry_count() -> float:
+    env_value = os.getenv("MINERU_LMDEPLOY_CACHE_MAX_ENTRY_COUNT")
+    if env_value is not None:
+        try:
+            configured_value = float(env_value)
+            if 0 < configured_value < 1:
+                logger.info(f"LMDeploy cache_max_entry_count (from env): {configured_value}")
+                return configured_value
+        except ValueError:
+            pass
+        logger.warning(
+            f"Invalid MINERU_LMDEPLOY_CACHE_MAX_ENTRY_COUNT value: {env_value}, using default 0.5"
+        )
+    return 0.5
+
+
 def set_default_batch_size() -> int:
+    env_value = os.getenv("MINERU_VLM_BATCH_SIZE")
+    if env_value is not None:
+        try:
+            configured_value = int(env_value)
+            if configured_value > 0:
+                logger.info(f"VLM transformers batch_size (from env): {configured_value}")
+                return configured_value
+        except ValueError:
+            pass
+        logger.warning(f"Invalid MINERU_VLM_BATCH_SIZE value: {env_value}, using auto default")
+
     try:
         device = get_device()
         gpu_memory = get_vram(device)

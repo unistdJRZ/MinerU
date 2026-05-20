@@ -403,7 +403,9 @@ class ManagedLocalServer:
             enable_vlm_preload=self.enable_vlm_preload,
         )
         self.base_url = f"http://{self.connect_host}:{resolved_port}"
-        output_base = Path(os.getenv("MINERU_API_OUTPUT_ROOT", "./output")).expanduser()
+        output_base = Path(
+            os.path.expandvars(os.getenv("MINERU_API_OUTPUT_ROOT", "./output"))
+        ).expanduser()
         output_root = (output_base / "router-workers" / self.server_id).resolve()
         output_root.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
@@ -1566,25 +1568,61 @@ async def fetch_router_compat_content_payload(
     task: RouterTaskRecord,
 ) -> tuple[int, dict[str, Any]]:
     client: httpx.AsyncClient = request.app.state.http_client
-    content_url = f"{task.upstream_base_url}{CONTENT_ENDPOINT}"
-    try:
-        response = await client.get(
-            content_url,
-            params={"ocr_id": task.upstream_task_id},
-            timeout=build_result_download_timeout(),
-        )
-    except httpx.HTTPError as exc:
-        await request.app.state.router_task_registry.increment_upstream_error(
-            task.task_id,
-            str(exc),
-        )
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    current_task = task
+    recovered_after_failure = False
+
+    while True:
+        content_url = f"{current_task.upstream_base_url}{CONTENT_ENDPOINT}"
+        try:
+            response = await client.get(
+                content_url,
+                params={"ocr_id": current_task.upstream_task_id},
+                timeout=build_result_download_timeout(),
+            )
+        except httpx.HTTPError as exc:
+            await request.app.state.router_task_registry.increment_upstream_error(
+                current_task.task_id,
+                str(exc),
+            )
+            if not recovered_after_failure:
+                recovered_after_failure = True
+                recovered = await recover_router_task_from_upstream(
+                    request,
+                    current_task.task_id,
+                )
+                if (
+                    recovered is not None
+                    and (
+                        recovered.upstream_base_url != current_task.upstream_base_url
+                        or recovered.upstream_task_id != current_task.upstream_task_id
+                    )
+                ):
+                    current_task = recovered
+                    continue
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if response.status_code == 404 and not recovered_after_failure:
+            recovered_after_failure = True
+            recovered = await recover_router_task_from_upstream(
+                request,
+                current_task.task_id,
+            )
+            if (
+                recovered is not None
+                and (
+                    recovered.upstream_base_url != current_task.upstream_base_url
+                    or recovered.upstream_task_id != current_task.upstream_task_id
+                )
+            ):
+                current_task = recovered
+                continue
+        break
 
     content_type = response.headers.get("content-type", "")
     if "application/json" not in content_type:
         detail = "content_router requires an upstream JSON /content response"
         await request.app.state.router_task_registry.increment_upstream_error(
-            task.task_id,
+            current_task.task_id,
             detail,
         )
         raise HTTPException(status_code=502, detail=detail)
@@ -1594,14 +1632,14 @@ async def fetch_router_compat_content_payload(
     except ValueError as exc:
         detail = f"Invalid content payload: {exc}"
         await request.app.state.router_task_registry.increment_upstream_error(
-            task.task_id,
+            current_task.task_id,
             detail,
         )
         raise HTTPException(status_code=502, detail=detail) from exc
 
     if response.status_code >= 500:
         await request.app.state.router_task_registry.increment_upstream_error(
-            task.task_id,
+            current_task.task_id,
             f"{response.status_code} {response_detail(response)}",
         )
     return response.status_code, payload

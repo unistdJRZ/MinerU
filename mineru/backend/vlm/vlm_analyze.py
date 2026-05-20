@@ -13,7 +13,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from .utils import enable_custom_logits_processors, set_default_gpu_memory_utilization, set_default_batch_size, \
-    set_lmdeploy_backend, mod_kwargs_by_device_type
+    set_lmdeploy_backend, mod_kwargs_by_device_type, set_default_lmdeploy_cache_max_entry_count
 from .model_output_to_middle_json import (
     append_page_blocks_to_middle_json,
     finalize_middle_json,
@@ -179,7 +179,7 @@ class ModelSingleton:
                         except ImportError:
                             raise ImportError("Please install lmdeploy to use the lmdeploy-engine backend.")
                         if "cache_max_entry_count" not in kwargs:
-                            kwargs["cache_max_entry_count"] = 0.5
+                            kwargs["cache_max_entry_count"] = set_default_lmdeploy_cache_max_entry_count()
 
                         device_type = os.getenv("MINERU_LMDEPLOY_DEVICE", "")
                         if device_type == "":
