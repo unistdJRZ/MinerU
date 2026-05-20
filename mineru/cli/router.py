@@ -464,6 +464,9 @@ class MultipartPayload:
                 return value
         return None
 
+    def get_field_values(self, name: str) -> list[str]:
+        return [value for key, value in self.fields if key == name]
+
 
 @dataclass
 class RouterTaskRecord:
@@ -1283,10 +1286,19 @@ async def submit_payload_to_upstream(
 def build_single_file_payload(
     source: MultipartPayload,
     upload: StagedUpload,
+    *,
+    ocr_id: str | None = None,
 ) -> MultipartPayload:
+    fields = [
+        (name, value)
+        for name, value in source.fields
+        if name not in {"ocr_id", "ocr_ids"}
+    ]
+    if ocr_id is not None:
+        fields.append(("ocr_id", ocr_id))
     return MultipartPayload(
         temp_dir=source.temp_dir,
-        fields=list(source.fields),
+        fields=fields,
         uploads=[upload],
     )
 
@@ -1341,14 +1353,59 @@ def build_router_compat_payload(source: MultipartPayload) -> MultipartPayload:
     )
 
 
-def get_router_compat_ocr_id(payload: MultipartPayload) -> str | None:
-    ocr_id = payload.get_field_value("ocr_id")
-    if ocr_id is None:
-        return None
-    normalized = ocr_id.strip()
-    if not normalized:
-        raise HTTPException(status_code=400, detail="ocr_id cannot be empty")
-    return normalized
+def parse_router_compat_ocr_id_values(values: list[str], field_name: str) -> list[str]:
+    ocr_ids: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized:
+            raise HTTPException(status_code=400, detail=f"{field_name} cannot be empty")
+        if field_name == "ocr_ids" and normalized.startswith("["):
+            try:
+                parsed = json.loads(normalized)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail="ocr_ids must be valid JSON") from exc
+            if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+                raise HTTPException(status_code=400, detail="ocr_ids JSON value must be a string array")
+            ocr_ids.extend(parse_router_compat_ocr_id_values(parsed, field_name))
+            continue
+        if field_name == "ocr_ids" and "," in normalized:
+            ocr_ids.extend(
+                parse_router_compat_ocr_id_values(normalized.split(","), field_name)
+            )
+            continue
+        ocr_ids.append(normalized)
+    return ocr_ids
+
+
+def get_router_compat_ocr_ids(
+    payload: MultipartPayload,
+    file_count: int,
+) -> list[str | None]:
+    legacy_values = parse_router_compat_ocr_id_values(
+        payload.get_field_values("ocr_id"),
+        "ocr_id",
+    )
+    batch_values = parse_router_compat_ocr_id_values(
+        payload.get_field_values("ocr_ids"),
+        "ocr_ids",
+    )
+
+    if legacy_values and batch_values:
+        raise HTTPException(status_code=400, detail="Use either ocr_id or ocr_ids, not both")
+
+    requested_ocr_ids = batch_values or legacy_values
+    if not requested_ocr_ids:
+        return [None] * file_count
+
+    if len(requested_ocr_ids) != file_count:
+        if legacy_values and len(legacy_values) == 1 and file_count != 1:
+            raise HTTPException(status_code=400, detail="ocr_id can only be used with a single files upload")
+        raise HTTPException(status_code=400, detail="ocr_ids count must match files count")
+
+    if len(set(requested_ocr_ids)) != len(requested_ocr_ids):
+        raise HTTPException(status_code=400, detail="ocr_ids cannot contain duplicate values")
+
+    return requested_ocr_ids
 
 
 async def submit_router_task(
@@ -1909,7 +1966,6 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         submitted_ocr_ids: list[str] = []
         try:
             payload = build_router_compat_payload(payload)
-            requested_ocr_id = get_router_compat_ocr_id(payload)
             file_uploads = [
                 upload for upload in payload.uploads if upload.field_name == "files"
             ]
@@ -1918,19 +1974,20 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
                     status_code=400,
                     content={"error": "file_parse_router requires at least one files upload"},
                 )
-            if requested_ocr_id is not None and len(file_uploads) != 1:
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "ocr_id can only be used with a single files upload"},
-                )
+            requested_ocr_ids = get_router_compat_ocr_ids(payload, len(file_uploads))
 
             for upload_index, upload in enumerate(file_uploads):
-                single_payload = build_single_file_payload(payload, upload)
+                requested_ocr_id = requested_ocr_ids[upload_index]
+                single_payload = build_single_file_payload(
+                    payload,
+                    upload,
+                    ocr_id=requested_ocr_id,
+                )
                 try:
                     router_task = await submit_router_task(
                         request,
                         single_payload,
-                        task_id=requested_ocr_id if upload_index == 0 else None,
+                        task_id=requested_ocr_id,
                     )
                 except HTTPException as exc:
                     status_code = (
